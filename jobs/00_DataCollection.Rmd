@@ -1,0 +1,79 @@
+---
+title: "00_DataCollection"
+output: html_document
+---
+
+## Preface
+
+This is the data collection script for the SDM NN. I originally used the environmental data in AusAMF and two other datasets, but I don't think I have enough environmental information to calculate distributions.
+
+So, we are starting from scratch here.
+
+The assumed working directory is the jobs folder.
+
+## Libraries
+```{r}
+library(terra)
+library(sf)
+library(tidyterra)
+```
+## Projection Paths
+```{r}
+#Rorqual does not have internet access on the node I need, so I saved the tif grid for conversion to CRS 3577
+local_grid = file.path("/home/herna499/links/projects/def-jstinchc/herna499/proj_data")
+
+Sys.setenv(PROJ_DATA = local_grid)
+Sys.setenv(PROJ_LIB  = local_grid)
+Sys.setenv(PROJ_NETWORK = "OFF")
+Sys.setenv(GDAL_HTTP_MAX_RETRY = "0")
+
+message("PROJ Search Paths: ", paste(sf_proj_search_paths(), collapse = ", "))
+
+sf_proj_network(enable = FALSE)
+```
+
+
+## AusAMF
+AusAMF datasets that are likely to overlap with other data sources are prefaced with `AA_`
+
+```{r}
+# load in abundance matrices, metadata, and taxonomy
+abundance = read.csv("../raw_data/AusAMF/abundance_matrix.csv", row.names = 1)
+AA_metadata = read.csv("../raw_data/AusAMF/sample_metadata.csv")
+AA_filtering = read.csv("../raw_data/AusAMF/filtering_info.csv")
+AA_taxonomy = read.csv("../raw_data/AusAMF/VT_taxonomy.csv")
+
+# env_cube for environmental data from AusAMF
+# input data for raster files is downloaded from the cited figshare in the manuscript
+# https://doi.org/10.6084/m9.figshare.28817378.v1
+env_cube = rast("../raw_data/AusAMF/AusAMF_env_cube.tif")
+env_cube = rename(env_cube, total_N = Total_N, avail_P = Avail_P, totalP = Total_P, elevation = Elevation, pH_cacl = pH) # this is just to keep names the same between the original metadata and that in the environmental cube. The mismatch is from the original paper.
+
+# crop to match spatial extent of Australia
+tocrop = terra::ext(112, 112+0.025*1681, -44, -44+0.025*1361)
+env_cube = terra::crop(env_cube, tocrop)
+
+# project data cube
+AA_envcube = project(
+  x = env_cube,
+  y = "EPSG:3577",
+  method = "bilinear",
+  use_gdal = TRUE
+)
+```
+
+## NVIS 7.0
+This is the vegetation layer from NVIS V7.0. I will preface this data with `NV_`.
+```{r}
+# check available layers from `.gdb` file
+gdb_path = "../raw_data/NVIS_V7/NVIS_V7_0_VECTOR_STATE_FILES_EXT.gdb/"
+NV_avail_layers = st_layers(gdb_path)
+NV_avail_layers$name
+
+# create a list to store layers
+# takes a looooooonnnngggg time
+NV_layers = vect(gdb_path, proxy = TRUE)
+NV_details = as.data.frame(vect(gdb_path, layer = NV_avail_layers$name[9]))
+NV_flat = as.data.frame(vect(gdb_path, layer = NV_avail_layers$name[10]))
+```
+

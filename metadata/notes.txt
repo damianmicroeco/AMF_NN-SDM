@@ -1,0 +1,5 @@
+Tern data is from: https://data.tern.org.au/model-derived/slga/NationalMaps/Covariates/Mosaics/90m/
+Tern descriptions are available here: https://esoil.io/TERNLandscapes/Public/Pages/SLGA/GetData-COGSDataStore_90m_Covariates.html
+
+Fire history as a GeoTiff: https://www.agriculture.gov.au/abares/forestsaustralia/forest-data-maps-and-tools/spatial-data/forest-fire?utm_source=chatgpt.com
+ 
