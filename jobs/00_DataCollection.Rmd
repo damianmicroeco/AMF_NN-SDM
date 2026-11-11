@@ -71,9 +71,181 @@ NV_avail_layers = st_layers(gdb_path)
 NV_avail_layers$name
 
 # create a list to store layers
-# takes a looooooonnnngggg time
-NV_layers = vect(gdb_path, proxy = TRUE)
+# layers 1-8 are the vector layers. 9 and 10 are mapping tables to convert numerical IDs to vegetation types
+NV_layers = lapply(NV_avail_layers$name[1:8], function(x) {
+  vect(gdb_path, layer = x, proxy = TRUE)
+  }
+)
+
 NV_details = as.data.frame(vect(gdb_path, layer = NV_avail_layers$name[9]))
 NV_flat = as.data.frame(vect(gdb_path, layer = NV_avail_layers$name[10]))
 ```
 
+## AusTraits
+
+Trait database of Australian plants. `AT_` prefixes.
+
+```{r}
+AT_traits = read.csv("../raw_data/austraits/austraits-data.csv")
+```
+
+## Fire History
+
+`FH_` prefixes.
+
+```{r}
+FH_firemap = rast("../raw_data/fire/GeoTIFF/fire_for16-21.tif")
+FH_firetable = read.csv("../raw_data/fire/GeoTIFF/Fire_For16-21_Attributes.csv")
+
+# reproject firemap
+FH_firemap = project(
+  x = FH_firemap,
+  y = "EPSG:3577",
+  method = "bilinear",
+  use_gdal = TRUE
+)
+```
+
+## IBRA7 Regions
+
+`IB_` prefixes.
+
+```{r}
+IB_regions = vect("../raw_data/IBRA7_regions/IBRA7_regions.shp")
+
+# reproject IB_regions
+IB_regions = project(
+  x = IB_regions,
+  y = "EPSG:3577"
+)
+```
+
+## IUCN Protection
+`IU_` prefixes.
+
+```{r}
+IU_protection = vect("../raw_data/IUCN/Protected_Areas_(CAPAD).shp")
+
+# reproject IU_protection
+IU_protection = project(
+  x = IU_protection,
+  y = "EPSG:3577"
+)
+```
+
+## Soil age
+`SA_` prefixes.
+
+```{r}
+SA_age = vect("../raw_data/soil_age/AUS_GA_2500k_GUPoly_Age.shp")
+
+SA_age = project(
+  x = SA_age,
+  y = "EPSG:3577"
+)
+```
+
+## TERN
+`TE_` prefixes. There is a lot of environmental raster data. So, let's combine into a raster data cube. Match extent of env_cube
+
+```{r}
+TE_files = list.files("../raw_data/tern/", full.names = TRUE)
+
+# I confirmed the tern files are in the same crs as the env_cube the bounding box is based on.
+
+# The maps are high resolution and large, so it's easy to crash the computer when cropping all layers at the same time. Here, we will do the cropping layer by layer in a loop.
+TE_cube = vector("list", length(TE_files))
+
+for (i in seq_along(TE_files)) {
+  cat("Processing file", i, "of", length(TE_files), "\n")
+  
+  r = rast(TE_files[i])
+  r_crop = terra::crop(r, tocrop)
+  
+  TE_cube[[i]] = r_crop
+  
+  # to save memory, we will remove the variables not in the data cube in the for loop
+  rm(r, r_crop)
+  gc()
+}
+
+# some of the grids are just slightly off in terms of extent, origin, and dimension. Like vvvvveeeeerrrrrryyyyy small differences. This creates an issue when trying to collapse them into a single data cube. The issue is in the quarterly NDVI measurements. We will resample those based on the TE_cube layer
+template = rast(TE_files[1])
+NDVI_files = TE_files[11:14]
+NDVI_aligned = vector("list", length(NDVI_files))
+
+for (i in seq_along(NDVI_files)) {
+  cat("Processing NDVI layer", i, "\n")
+
+  r = rast(NDVI_files[i])
+
+  # Align to reference grid
+  r_aligned = terra::resample(
+    r,
+    template,
+    method = "bilinear"
+  )
+
+  # Crop to desired extent
+  r_aligned = terra::crop(r_aligned, tocrop)
+
+  NDVI_aligned[[i]] = r_aligned
+
+  rm(r, r_aligned)
+  gc()
+}
+
+# replace the misaligned NDVI files
+TE_cube[11:14] = NDVI_aligned
+
+# combine cropped layers into a data cube
+TE_cube = rast(TE_cube)
+
+# reproject TE_cube
+TE_cube = project(
+  x = TE_cube,
+  y = "EPSG:3577",
+  method = "bilinear",
+  use_gdal = TRUE,
+  filename = "../processed_data/TE_cube_projection.tif"
+)
+```
+
+```{r}
+# potential work around for R crashing. It shouldn't be a memory issue, but just in case, let's let terra use a temp directory and override the default terra limits by using BIGTIFF=YES.
+
+# Set temporary directory
+terra_tmp = "../processed_data/terra_temp"
+
+dir.create(
+  terra_tmp,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+terraOptions(
+  tempdir = terra_tmp,
+  memfrac = 0.5,
+  progress = 1
+)
+
+# Combine layers
+TE_cube = rast(TE_cube)
+
+# Check the raster before projecting
+print(TE_cube)
+
+# Project to EPSG:3577
+TE_cube = project(
+  x = TE_cube,
+  y = "EPSG:3577",
+  method = "bilinear",
+  use_gdal = TRUE,
+  filename = "../processed_data/TE_cube_projection.tif",
+  overwrite = TRUE,
+  wopt = list(
+    gdal = c("BIGTIFF=YES")
+  )
+)
+
+```
