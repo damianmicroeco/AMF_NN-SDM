@@ -1,0 +1,1173 @@
+---
+title: "00_DataCollection"
+output: html_document
+---
+
+## Preface
+
+This is the data collection script for the SDM NN. I originally used the environmental data in AusAMF and two other datasets, but I don't think I have enough environmental information to calculate distributions.
+
+So, we are starting from scratch here.
+
+The assumed working directory is the jobs folder.
+
+## Libraries
+```{r}
+library(terra)
+library(sf)
+library(tidyterra)
+```
+
+## Projection Paths
+```{r}
+#Rorqual does not have internet access on the node I need, so I saved the tif grid for conversion to CRS 3577
+local_grid = file.path("/home/herna499/links/projects/def-jstinchc/herna499/proj_data")
+
+Sys.setenv(PROJ_DATA = local_grid)
+Sys.setenv(PROJ_LIB  = local_grid)
+Sys.setenv(PROJ_NETWORK = "OFF")
+Sys.setenv(GDAL_HTTP_MAX_RETRY = "0")
+
+message("PROJ Search Paths: ", paste(sf_proj_search_paths(), collapse = ", "))
+
+sf_proj_network(enable = FALSE)
+```
+
+## terra options
+
+```{r}
+# potential work around for R crashing. It shouldn't be a memory issue, but just in case, let's let terra use a temp directory and override the default terra limits by using BIGTIFF=YES.
+
+# Set temporary directory
+terra_tmp = "../processed_data/terra_temp"
+
+dir.create(
+  terra_tmp,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+terraOptions(
+  tempdir = terra_tmp,
+  memfrac = 0.5,
+  progress = 1
+)
+```
+
+## Alignment Function
+
+```{r}
+## Align rasters to the main template raster
+align_raster = function(x, template, categorical = NULL,
+                        filename = "", overwrite = TRUE) {
+  aligned_layers = vector("list", nlyr(x))
+  for (i in seq_len(nlyr(x))) {
+    layer = x[[i]]
+
+    # Determine whether this layer is categorical
+    if (is.null(categorical)) {
+      data_type = datatype(layer)
+      is_categorical = grepl(
+        "INT|LOG",
+        data_type,
+        ignore.case = TRUE
+      )
+    } else {
+      is_categorical = categorical[i]
+    }
+
+    # Select resampling method
+    method = if (is_categorical) "near" else "bilinear"
+
+    cat(
+      "Aligning layer", i, "of", nlyr(x),
+      ":", names(layer),
+      "- method:", method, "\n"
+    )
+
+    aligned_layers[[i]] = project(
+      x = layer,
+      y = template,
+      method = method,
+      use_gdal = TRUE
+    )
+  }
+
+  # Combine aligned layers
+  aligned = rast(aligned_layers)
+
+  # Optionally write the result to disk
+  if (filename != "") {
+    aligned = writeRaster(
+      aligned,
+      filename,
+      overwrite = overwrite,
+      wopt = list(gdal = c("BIGTIFF=YES"))
+    )
+  }
+  return(aligned)
+}
+```
+
+
+## AusAMF
+AusAMF datasets that are likely to overlap with other data sources are prefaced with `AA_`
+
+```{r}
+# load in abundance matrices, metadata, and taxonomy
+abundance = read.csv("../raw_data/AusAMF/abundance_matrix.csv", row.names = 1)
+AA_metadata = read.csv("../raw_data/AusAMF/sample_metadata.csv")
+AA_filtering = read.csv("../raw_data/AusAMF/filtering_info.csv")
+AA_taxonomy = read.csv("../raw_data/AusAMF/VT_taxonomy.csv")
+
+# env_cube for environmental data from AusAMF
+# input data for raster files is downloaded from the cited figshare in the manuscript
+# https://doi.org/10.6084/m9.figshare.28817378.v1
+env_cube = rast("../raw_data/AusAMF/AusAMF_env_cube.tif")
+env_cube = rename(env_cube, total_N = Total_N, avail_P = Avail_P, totalP = Total_P, elevation = Elevation, pH_cacl = pH) # this is just to keep names the same between the original metadata and that in the environmental cube. The mismatch is from the original paper.
+
+# crop to match spatial extent of Australia
+tocrop = terra::ext(112, 112+0.025*1681, -44, -44+0.025*1361)
+env_cube = terra::crop(env_cube, tocrop)
+
+# project data cube
+AA_envcube = project(
+  x = env_cube,
+  y = "EPSG:3577",
+  method = "bilinear",
+  use_gdal = TRUE
+)
+```
+
+```{r}
+## Determine main template raster
+
+# Use the first AusAMF layer as the reference grid
+rast_template = AA_envcube[[1]]
+
+# Inspect geometry
+print(rast_template)
+cat("CRS:", crs(rast_template), "\n")
+cat("Resolution:", res(rast_template), "\n")
+cat("Dimensions:", dim(rast_template), "\n")
+cat("Extent:", as.character(ext(rast_template)), "\n")
+```
+
+## NVIS 7.0
+This is the vegetation layer from NVIS V7.0. I will preface this data with `NV_`.
+```{r}
+# check available layers from `.gdb` file
+gdb_path = "../raw_data/NVIS_V7/NVIS_V7_0_VECTOR_STATE_FILES_EXT.gdb/"
+NV_avail_layers = st_layers(gdb_path)
+NV_avail_layers$name
+
+# create a list to store layers
+# layers 1-8 are the vector layers. 9 and 10 are mapping tables to convert numerical IDs to vegetation types
+NV_layers = lapply(NV_avail_layers$name[1:8], function(x) {
+  vect(gdb_path, layer = x, proxy = TRUE)
+  }
+)
+
+NV_details = as.data.frame(vect(gdb_path, layer = NV_avail_layers$name[9]))
+NV_flat = as.data.frame(vect(gdb_path, layer = NV_avail_layers$name[10]))
+```
+
+## AusTraits
+
+Trait database of Australian plants. `AT_` prefixes.
+
+```{r}
+AT_traits = read.csv("../raw_data/austraits/austraits-data.csv")
+```
+
+## Fire History
+
+`FH_` prefixes.
+
+```{r}
+FH_firemap = rast("../raw_data/fire/GeoTIFF/fire_for16-21.tif")
+FH_firetable = read.csv("../raw_data/fire/GeoTIFF/Fire_For16-21_Attributes.csv")
+
+# reproject firemap
+FH_firemap = align_raster(FH_firemap, rast_template)
+```
+
+## IBRA7 Regions
+
+`IB_` prefixes.
+
+```{r}
+IB_regions = vect("../raw_data/IBRA7_regions/IBRA7_regions.shp")
+
+# reproject IB_regions
+IB_regions = project(
+  x = IB_regions,
+  y = "EPSG:3577"
+)
+```
+
+## IUCN Protection
+`IU_` prefixes.
+
+```{r}
+IU_protection = vect("../raw_data/IUCN/Protected_Areas_(CAPAD).shp")
+
+# reproject IU_protection
+IU_protection = project(
+  x = IU_protection,
+  y = "EPSG:3577"
+)
+```
+
+## Soil age
+`SA_` prefixes.
+
+```{r}
+SA_age = vect("../raw_data/soil_age/AUS_GA_2500k_GUPoly_Age.shp")
+
+SA_age = project(
+  x = SA_age,
+  y = "EPSG:3577"
+)
+```
+
+## TERN
+`TE_` prefixes. There is a lot of environmental raster data. So, let's combine into a raster data cube. Match extent of env_cube
+
+```{r}
+TE_files = list.files("../raw_data/tern/", full.names = TRUE)
+
+# I confirmed the tern files are in the same crs as the env_cube the bounding box is based on.
+
+# The maps are high resolution and large, so it's easy to crash the computer when cropping all layers at the same time. Here, we will do the cropping layer by layer in a loop.
+TE_cube = vector("list", length(TE_files))
+
+for (i in seq_along(TE_files)) {
+  cat("Processing file", i, "of", length(TE_files), "\n")
+  
+  r = rast(TE_files[i])
+  r_crop = terra::crop(r, tocrop)
+  
+  TE_cube[[i]] = r_crop
+  
+  # to save memory, we will remove the variables not in the data cube in the for loop
+  rm(r, r_crop)
+  gc()
+}
+
+# some of the grids are just slightly off in terms of extent, origin, and dimension. Like vvvvveeeeerrrrrryyyyy small differences. This creates an issue when trying to collapse them into a single data cube. The issue is in the quarterly NDVI measurements. We will resample those based on the first TE_cube layer
+template = rast(TE_files[1])
+NDVI_files = TE_files[11:14]
+NDVI_aligned = vector("list", length(NDVI_files))
+
+for (i in seq_along(NDVI_files)) {
+  cat("Processing NDVI layer", i, "\n")
+
+  r = rast(NDVI_files[i])
+
+  # Align to reference grid
+  r_aligned = terra::resample(
+    r,
+    template,
+    method = "bilinear"
+  )
+
+  # Crop
+  r_aligned = terra::crop(r_aligned, tocrop)
+
+  NDVI_aligned[[i]] = r_aligned
+
+  rm(r, r_aligned)
+  gc()
+}
+
+# replace the misaligned NDVI files
+TE_cube[11:14] = NDVI_aligned
+
+# combine cropped layers into a data cube
+TE_cube = rast(TE_cube)
+
+# Check the raster before projecting
+print(TE_cube)
+
+# reproject TE_cube
+TE_cube = align_raster(
+  x = TE_cube,
+  template = rast_template,
+  filename = "../processed_data/TE_cube_projection.tif"
+)
+```
+
+## Building single data cube for analyses
+
+For use in neural network, we want to combine everything into a single data cube to simplify extraction of data and ensure consistency of pixels between layers.
+
+```{r}
+# for intermediate datasets
+raster_dir = "../processed_data/rasters"
+
+dir.create(
+  raster_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# for final data cube
+final_cube = "../processed_data/AMF_environmental_cube.tif"
+
+## Verify main template
+
+stopifnot(
+  !is.na(crs(rast_template)),
+  ncell(rast_template) > 0
+)
+
+cat("Master grid CRS:", crs(rast_template), "\n")
+cat("Resolution:", res(rast_template), "\n")
+cat("Dimensions:", dim(rast_template), "\n")
+cat("Extent:", as.character(ext(rast_template)), "\n")
+cat("Number of cells:", ncell(rast_template), "\n")
+```
+
+```{r}
+## Prepare existing raster datasets
+
+# Add dataset prefixes to layer names
+names(AA_envcube) = paste0("AA_", names(AA_envcube))
+names(FH_firemap) = paste0("FH_", names(FH_firemap))
+names(TE_cube) = paste0("TE_", names(TE_cube))
+
+# Check spatial alignment against the main template
+stopifnot(
+  compareGeom(AA_envcube, rast_template, stopOnError = FALSE),
+  compareGeom(FH_firemap, rast_template, stopOnError = FALSE),
+  compareGeom(TE_cube, rast_template, stopOnError = FALSE)
+)
+
+# Inspect layer names
+cat("AusAMF layers:\n")
+print(names(AA_envcube))
+
+cat("Fire history layers:\n")
+print(names(FH_firemap))
+
+cat("TERN layers:\n")
+print(names(TE_cube))
+
+# Combine raster datasets
+environmental_cube = c(
+  AA_envcube,
+  FH_firemap,
+  TE_cube
+)
+
+# Write intermediate cube to disk
+intermediate_cube = "../processed_data/environmental_cube_intermediate.tif"
+
+# Remove if exists
+file.remove(intermediate_cube)
+
+writeRaster(
+  environmental_cube,
+  filename = intermediate_cube,
+  overwrite = TRUE,
+  wopt = list(
+    gdal = c("BIGTIFF=YES", "COMPRESS=LZW"),
+    datatype = "FLT4S"
+  )
+)
+
+# Reload saved cube
+environmental_cube = rast(intermediate_cube)
+
+# Report output
+print(environmental_cube)
+cat("Saved intermediate cube:", intermediate_cube, "\n")
+
+# Verify alignment
+compareGeom(
+  environmental_cube,
+  rast_template,
+  stopOnError = FALSE
+)
+```
+
+```{r}
+### Inspect NVIS vector to determine how to rasterize
+
+# Inspect NVIS attribute fields
+for (i in seq_along(NV_layers)) {
+  cat("\n", NV_avail_layers$name[i], "\n")
+  print(names(NV_layers[[i]]))
+}
+
+# Inspect NVIS categories
+NV_categories = list()
+
+for (layer_name in NV_avail_layers$name[1:8]) {
+
+  cat("\nInspecting:", layer_name, "\n")
+
+  # SPATIAL_MIX
+  query_mix = paste0(
+    "SELECT DISTINCT SPATIAL_MIX FROM ", layer_name
+  )
+
+  mix = st_read(
+    dsn = gdb_path,
+    query = query_mix,
+    quiet = TRUE
+  )
+
+  # NO_VEG_DESC
+  query_noveg = paste0(
+    "SELECT DISTINCT NO_VEG_DESC FROM ", layer_name
+  )
+
+  noveg = st_read(
+    dsn = gdb_path,
+    query = query_noveg,
+    quiet = TRUE
+  )
+
+  NV_categories[[layer_name]] = list(
+    SPATIAL_MIX = st_drop_geometry(mix),
+    NO_VEG_DESC = st_drop_geometry(noveg)
+  )
+}
+
+NV_categories
+
+## reproject NVIS from EPSG:9473 to EPSG:3577
+NV_TAS = vect(
+  gdb_path,
+  layer = "NVIS7_0_AUST_EXT_TAS"
+)
+
+NV_TAS
+
+# test transformation
+NV_TAS_3577 = project(
+  NV_TAS,
+  rast_template
+)
+
+NV_TAS_L1 = rasterize(
+  x = NV_TAS_3577,
+  y = rast_template,
+  field = "NVISDSC1"
+)
+
+names(NV_TAS_L1) = "NV_NVISTAS_L1"
+
+NV_TAS_L1
+
+compareGeom(
+  NV_TAS_L1,
+  rast_template,
+  stopOnError = FALSE
+)
+
+NV_fields = c(
+  paste0("NVISDSC", 1:6),
+  paste0("VEGPROP", 1:6)
+)
+
+NV_TAS_rasters = vector("list", length(NV_fields))
+
+for (i in seq_along(NV_fields)) {
+
+  field = NV_fields[i]
+
+  cat("Rasterizing:", field, "\n")
+
+  NV_TAS_rasters[[i]] = rasterize(
+    x = NV_TAS_3577,
+    y = rast_template,
+    field = field
+  )
+
+  names(NV_TAS_rasters[[i]]) = paste0("NV_TAS_", field)
+}
+
+# Combine into a multilayer raster
+NV_TAS_cube = rast(NV_TAS_rasters)
+NV_TAS_cube
+
+# Value ranges
+data.frame(
+  layer = names(NV_TAS_cube),
+  global(
+    NV_TAS_cube,
+    fun = c("min", "max"),
+    na.rm = TRUE
+  )
+)
+
+# repeat inspection with a more complete state
+NV_WA = vect(
+  gdb_path,
+  layer = "NVIS7_0_AUST_EXT_WA"
+)
+
+NV_WA_3577 = project(
+  NV_WA,
+  rast_template
+)
+
+NV_WA_rasters = vector("list", length(NV_fields))
+
+for (i in seq_along(NV_fields)) {
+
+  field = NV_fields[i]
+
+  cat("Rasterizing:", field, "\n")
+
+  NV_WA_rasters[[i]] = rasterize(
+    x = NV_WA_3577,
+    y = rast_template,
+    field = field
+  )
+
+  names(NV_WA_rasters[[i]]) = paste0("NV_WA_", field)
+}
+
+NV_WA_cube = rast(NV_WA_rasters)
+
+global(
+  NV_WA_cube,
+  fun = c("min", "max"),
+  na.rm = TRUE
+)
+
+compareGeom(
+  NV_WA_cube,
+  rast_template,
+  stopOnError = FALSE
+)
+
+
+
+```
+NVIS data is very different in terms of completion across states. For now, we will just rasterize everything and decide feature selection later.
+
+```{r}
+# Inspect vector attribute fields and data types
+
+vector_fields = function(x) {
+  v = values(x)
+
+  data.frame(
+    field = names(v),
+    data_type = vapply(
+      v,
+      function(z) paste(class(z), collapse = "/"),
+      character(1)
+    )
+  )
+}
+
+IB_fields = vector_fields(IB_regions)
+IU_fields = vector_fields(IU_protection)
+SA_fields = vector_fields(SA_age)
+
+IB_fields
+IU_fields
+SA_fields
+```
+
+```{r}
+## Create lookup tables for categorical data
+
+# Inspect IBRA categories
+IB_categories = unique(
+  values(IB_regions)[, c("REG_CODE_7", "REG_NAME_7")]
+)
+
+nrow(IB_categories)
+
+head(IB_categories)
+
+summary(IB_regions$HECTARES)
+
+nrow(IB_categories)
+
+summary(IB_regions$HECTARES)
+
+sum(is.na(IB_regions$REG_CODE_7))
+sum(is.na(IB_regions$REG_NAME_7))
+
+IB_categories = unique(
+  values(IB_regions)[, c("REG_CODE_7", "REG_NAME_7")]
+)
+
+IB_categories$IBRA_ID = seq_len(nrow(IB_categories))
+
+IB_regions$IBRA_ID = IB_categories$IBRA_ID[
+  match(IB_regions$REG_CODE_7, IB_categories$REG_CODE_7)
+]
+
+head(IB_categories)
+
+IB_rasters = list()
+
+IB_rasters[["IBRA_ID"]] = rasterize(
+  x = IB_regions,
+  y = rast_template,
+  field = "IBRA_ID"
+)
+
+IB_rasters[["HECTARES"]] = rasterize(
+  x = IB_regions,
+  y = rast_template,
+  field = "HECTARES"
+)
+
+IB_cube = rast(IB_rasters)
+
+names(IB_cube) = c("IB_IBRA_ID", "IB_HECTARES")
+
+writeRaster(
+  IB_cube,
+  filename = "../processed_data/rasters/IB_cube.tif",
+  overwrite = TRUE,
+  wopt = list(gdal = c("BIGTIFF=YES", "COMPRESS=LZW"))
+)
+
+write.csv(
+  IB_categories,
+  file = "../processed_data/rasters/IBRA_lookup.csv",
+  row.names = FALSE
+)
+```
+```{r}
+## Repeat above for IUCN data
+
+IU_attributes = values(IU_protection)
+
+# Number of polygons
+nrow(IU_attributes)
+
+# Missing values per field
+colSums(is.na(IU_attributes))
+
+IU_character_fields = names(IU_attributes)[
+  sapply(IU_attributes, is.character)
+]
+
+sapply(
+  IU_attributes[IU_character_fields],
+  function(x) length(unique(na.omit(x)))
+)
+
+IU_lookup = list()
+
+for (field in IU_character_fields) {
+
+  categories = unique(
+    IU_attributes[[field]][!is.na(IU_attributes[[field]])]
+  )
+
+  encoded_field = paste0("ID_", field)
+
+  # Create integer-coded attribute
+  IU_protection[[encoded_field]] = match(
+    IU_attributes[[field]],
+    categories
+  )
+
+  # Only create a lookup entry when values exist
+  if (length(categories) > 0) {
+    IU_lookup[[field]] = data.frame(
+      attribute = field,
+      code = seq_along(categories),
+      value = categories
+    )
+  }
+}
+
+IU_lookup = do.call(rbind, IU_lookup)
+rownames(IU_lookup) = NULL
+
+IU_raster_fields = c(
+  names(IU_attributes)[
+    sapply(IU_attributes, is.numeric)
+  ],
+  paste0("ID_", IU_character_fields)
+)
+
+IU_raster_fields
+length(IU_raster_fields)
+
+IU_rasters = vector("list", length(IU_raster_fields))
+
+for (i in seq_along(IU_raster_fields)) {
+
+  field = IU_raster_fields[i]
+
+  cat(
+    "Rasterizing", i, "of", length(IU_raster_fields),
+    ":", field, "\n"
+  )
+
+  IU_rasters[[i]] = rasterize(
+    x = IU_protection,
+    y = rast_template,
+    field = field
+  )
+
+  names(IU_rasters[[i]]) = paste0("IU_", field)
+}
+
+IU_cube = rast(IU_rasters)
+
+writeRaster(
+  IU_cube,
+  filename = "../processed_data/rasters/IU_cube.tif",
+  overwrite = TRUE,
+  wopt = list(gdal = c("BIGTIFF=YES", "COMPRESS=LZW"))
+)
+
+write.csv(
+  IU_lookup,
+  file = "../processed_data/rasters/IUCN_lookup.csv",
+  row.names = FALSE
+)
+```
+```{r}
+## The raster files are taking up quite a bit of memory (~30 Gb environment total)
+## let's clear up large rasters from memory that we've written to disk
+rm(
+  IB_rasters,
+  IB_cube,
+  IU_rasters,
+  IU_cube,
+  IU_attributes
+)
+
+gc()
+```
+
+```{r}
+## Repeat for soil age polygons
+SA_attributes = values(SA_age)
+
+nrow(SA_attributes)
+
+colSums(is.na(SA_attributes))
+
+SA_character_fields = names(SA_attributes)[
+  sapply(SA_attributes, is.character)
+]
+
+sapply(
+  SA_attributes[SA_character_fields],
+  function(x) length(unique(na.omit(x)))
+)
+
+SA_lookup = list()
+
+for (field in SA_character_fields) {
+
+  categories = unique(
+    SA_attributes[[field]][!is.na(SA_attributes[[field]])]
+  )
+
+  encoded_field = paste0("ID_", field)
+
+  SA_age[[encoded_field]] = match(
+    SA_attributes[[field]],
+    categories
+  )
+
+  if (length(categories) > 0) {
+    SA_lookup[[field]] = data.frame(
+      attribute = field,
+      code = seq_along(categories),
+      value = categories
+    )
+  }
+}
+
+SA_lookup = do.call(rbind, SA_lookup)
+rownames(SA_lookup) = NULL
+
+SA_other_fields = names(SA_attributes)[
+  !sapply(SA_attributes, is.character)
+]
+
+sapply(
+  SA_attributes[SA_other_fields],
+  class
+)
+
+# to handle dates, we'll convert them to numeric as seconds since 1 Jan 1970
+range(SA_attributes$captdate)
+range(SA_attributes$moddate)
+
+head(SA_attributes[, c("captdate", "moddate")])
+
+SA_age$captdate_days = as.numeric(
+  as.Date(SA_attributes$captdate)
+)
+
+SA_age$moddate_days = as.numeric(
+  as.Date(SA_attributes$moddate)
+)
+
+SA_raster_fields = c(
+  names(SA_attributes)[
+    sapply(SA_attributes, is.numeric)
+  ],
+  paste0("ID_", SA_character_fields),
+  "captdate_days",
+  "moddate_days"
+)
+
+SA_raster_fields
+length(SA_raster_fields)
+
+SA_rasters = vector("list", length(SA_raster_fields))
+
+for (i in seq_along(SA_raster_fields)) {
+
+  field = SA_raster_fields[i]
+
+  cat(
+    "Rasterizing", i, "of", length(SA_raster_fields),
+    ":", field, "\n"
+  )
+
+  SA_rasters[[i]] = rasterize(
+    x = SA_age,
+    y = rast_template,
+    field = field
+  )
+
+  names(SA_rasters[[i]]) = paste0("SA_", field)
+}
+
+SA_cube = rast(SA_rasters)
+
+writeRaster(
+  SA_cube,
+  filename = "../processed_data/rasters/SA_cube.tif",
+  overwrite = TRUE,
+  wopt = list(
+    gdal = c("BIGTIFF=YES", "COMPRESS=LZW")
+  )
+)
+
+write.csv(
+  SA_lookup,
+  file = "../processed_data/rasters/Soil_age_lookup.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+## memory cleanup
+rm(
+  # NVIS
+  NV_TAS,
+  NV_TAS_3577,
+  NV_TAS_rasters,
+  NV_TAS_cube,
+  NV_WA,
+  NV_WA_3577,
+  NV_WA_rasters,
+  NV_WA_cube,
+
+  # IBRA
+  IB_regions,
+  IB_rasters,
+  IB_cube,
+
+  # IUCN
+  IU_protection,
+  IU_rasters,
+  IU_cube,
+  IU_attributes,
+
+  # Soil age
+  SA_age,
+  SA_rasters,
+  SA_cube,
+  SA_attributes
+)
+
+gc()
+```
+```{r}
+### NVIS conversion
+## NVIS rasterization: all Australian state/territory layers
+
+NV_output = "../processed_data/rasters/NV_cube.tif"
+NV_lookup_output = "../processed_data/rasters/NVIS_lookup.csv"
+
+## 1. Load and project all eight vector layers
+
+NV_states = lapply(
+  NV_avail_layers$name[1:8],
+  function(layer_name) {
+
+    cat("Loading:", layer_name, "\n")
+
+    x = vect(
+      gdb_path,
+      layer = layer_name
+    )
+
+    project(
+      x,
+      rast_template
+    )
+  }
+)
+
+names(NV_states) = sub(
+  "NVIS7_0_AUST_EXT_",
+  "",
+  NV_avail_layers$name[1:8]
+)
+
+
+## 2. Identify attribute fields
+
+NV_attributes = lapply(
+  NV_states,
+  values
+)
+
+NV_fields = names(NV_attributes[[1]])
+
+# Check that all state layers have the same fields
+stopifnot(
+  all(vapply(
+    NV_attributes,
+    function(x) setequal(names(x), NV_fields),
+    logical(1)
+  ))
+)
+
+
+## 3. Identify field types across all states
+
+NV_character_fields = NV_fields[
+  vapply(NV_attributes[[1]], is.character, logical(1))
+]
+
+NV_date_fields = NV_fields[
+  vapply(
+    NV_attributes[[1]],
+    function(x) inherits(x, "Date") ||
+      inherits(x, "POSIXt"),
+    logical(1)
+  )
+]
+
+NV_numeric_fields = NV_fields[
+  vapply(NV_attributes[[1]], is.numeric, logical(1)) &
+    !NV_fields %in% NV_date_fields
+]
+
+NV_logical_fields = NV_fields[
+  vapply(NV_attributes[[1]], is.logical, logical(1))
+]
+
+
+## 4. Create global lookup tables and encode character fields
+
+NV_lookup = list()
+
+for (field in NV_character_fields) {
+
+  cat("Encoding:", field, "\n")
+
+  # Collect unique values across all states
+  categories = unique(
+    unlist(
+      lapply(
+        NV_attributes,
+        function(x) x[[field]]
+      ),
+      use.names = FALSE
+    )
+  )
+
+  categories = categories[!is.na(categories)]
+
+  encoded_field = paste0("ID_", field)
+
+  # Create one consistent encoding across all states
+  for (state in names(NV_states)) {
+
+    NV_states[[state]][[encoded_field]] = match(
+      NV_attributes[[state]][[field]],
+      categories
+    )
+
+  }
+
+  if (length(categories) > 0) {
+
+    NV_lookup[[field]] = data.frame(
+      attribute = field,
+      code = seq_along(categories),
+      value = categories
+    )
+
+  }
+}
+
+NV_lookup = do.call(rbind, NV_lookup)
+rownames(NV_lookup) = NULL
+
+
+## 5. Convert date fields to numeric days since 1970
+
+for (field in NV_date_fields) {
+
+  cat("Converting date:", field, "\n")
+
+  for (state in names(NV_states)) {
+
+    NV_states[[state]][[paste0(field, "_days")]] =
+      as.numeric(as.Date(NV_attributes[[state]][[field]]))
+
+  }
+
+}
+
+
+## 6. Convert logical fields to integers
+
+for (field in NV_logical_fields) {
+
+  for (state in names(NV_states)) {
+
+    NV_states[[state]][[field]] = as.integer(
+      NV_attributes[[state]][[field]]
+    )
+
+  }
+
+}
+
+
+## 7. Assemble raster field list
+
+NV_raster_fields = c(
+  NV_numeric_fields,
+  NV_logical_fields,
+  paste0("ID_", NV_character_fields),
+  paste0(NV_date_fields, "_days")
+)
+
+cat(
+  "Total attributes to rasterize:",
+  length(NV_raster_fields),
+  "\n"
+)
+
+
+## 8. Rasterize all attributes for each state
+
+NV_rasters = list()
+
+for (state in names(NV_states)) {
+
+  cat("\nProcessing state:", state, "\n")
+
+  NV_rasters[[state]] = vector(
+    "list",
+    length(NV_raster_fields)
+  )
+
+  for (i in seq_along(NV_raster_fields)) {
+
+    field = NV_raster_fields[i]
+
+    cat(
+      "Rasterizing", i, "of", length(NV_raster_fields),
+      ":", field, "\n"
+    )
+
+    NV_rasters[[state]][[i]] = rasterize(
+      x = NV_states[[state]],
+      y = rast_template,
+      field = field
+    )
+
+    names(NV_rasters[[state]][[i]]) =
+      paste0("NV_", state, "_", field)
+
+  }
+
+  NV_rasters[[state]] = rast(NV_rasters[[state]])
+
+}
+
+
+## 9. Combine all state raster cubes
+
+NV_cube = rast(
+  unlist(NV_rasters, recursive = FALSE)
+)
+
+print(NV_cube)
+
+
+## 10. Verify alignment
+
+stopifnot(
+  compareGeom(
+    NV_cube,
+    rast_template,
+    stopOnError = FALSE
+  )
+)
+
+
+## 11. Save raster cube
+
+writeRaster(
+  NV_cube,
+  filename = NV_output,
+  overwrite = TRUE,
+  wopt = list(
+    gdal = c("BIGTIFF=YES", "COMPRESS=LZW")
+  )
+)
+
+
+## 12. Save lookup table
+
+write.csv(
+  NV_lookup,
+  file = NV_lookup_output,
+  row.names = FALSE
+)
+
+
+## 13. Confirm output
+
+cat("NVIS raster cube saved:", NV_output, "\n")
+cat("NVIS lookup table saved:", NV_lookup_output, "\n")
+
+print(NV_cube)
+print(file.info(NV_output)$size / 1024^2)
+
+
+## 14. Clear temporary objects
+
+rm(
+  NV_states,
+  NV_attributes,
+  NV_rasters,
+  NV_cube
+)
+
+gc()
+```
+
