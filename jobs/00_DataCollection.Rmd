@@ -1170,3 +1170,161 @@ rm(
 gc()
 ```
 
+# Starting up again after NVIS projections
+
+Reload libraries and temp folders for terra.
+## Libraries
+```{r}
+library(terra)
+library(sf)
+library(tidyterra)
+```
+
+## Projection Paths
+```{r}
+#Rorqual does not have internet access on the node I need, so I saved the tif grid for conversion to CRS 3577
+local_grid = file.path("/home/herna499/links/projects/def-jstinchc/herna499/proj_data")
+
+Sys.setenv(PROJ_DATA = local_grid)
+Sys.setenv(PROJ_LIB  = local_grid)
+Sys.setenv(PROJ_NETWORK = "OFF")
+Sys.setenv(GDAL_HTTP_MAX_RETRY = "0")
+
+message("PROJ Search Paths: ", paste(sf_proj_search_paths(), collapse = ", "))
+
+sf_proj_network(enable = FALSE)
+```
+
+## terra options
+
+```{r}
+# potential work around for R crashing. It shouldn't be a memory issue, but just in case, let's let terra use a temp directory and override the default terra limits by using BIGTIFF=YES.
+
+# Set temporary directory
+terra_tmp = "../processed_data/terra_temp"
+
+dir.create(
+  terra_tmp,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+terraOptions(
+  tempdir = terra_tmp,
+  memfrac = 0.5,
+  progress = 1
+)
+```
+
+## Load intermediate raster cubes
+
+```{r}
+environmental_cube = rast(
+  "../processed_data/environmental_cube_intermediate.tif"
+)
+
+IB_cube = rast(
+  "../processed_data/rasters/IB_cube.tif"
+)
+
+IU_cube = rast(
+  "../processed_data/rasters/IU_cube.tif"
+)
+
+SA_cube = rast(
+  "../processed_data/rasters/SA_cube.tif"
+)
+
+NV_cube = rast(
+  "../processed_data/rasters/NV_cube.tif"
+)
+
+
+## Inspect dimensions and layer counts
+
+lapply(
+  list(
+    environmental = environmental_cube,
+    IBRA = IB_cube,
+    IUCN = IU_cube,
+    soil_age = SA_cube,
+    NVIS = NV_cube
+  ),
+  function(x) {
+    list(
+      dimensions = dim(x),
+      layers = nlyr(x),
+      names = names(x),
+      resolution = res(x),
+      extent = ext(x),
+      CRS = crs(x)
+    )
+  }
+)
+```
+
+## Verify alignment of geometries
+
+```{r}
+geometry_check = c(
+  IBRA = compareGeom(
+    environmental_cube, IB_cube,
+    stopOnError = FALSE
+  ),
+  IUCN = compareGeom(
+    environmental_cube, IU_cube,
+    stopOnError = FALSE
+  ),
+  soil_age = compareGeom(
+    environmental_cube, SA_cube,
+    stopOnError = FALSE
+  ),
+  NVIS = compareGeom(
+    environmental_cube, NV_cube,
+    stopOnError = FALSE
+  )
+)
+
+print(geometry_check)
+```
+
+## Stack cubes
+
+```{r}
+AMF_cube = c(
+  environmental_cube,
+  IB_cube,
+  IU_cube,
+  SA_cube,
+  NV_cube
+)
+
+# Check the combined cube
+AMF_cube
+
+# Verify layer count and names
+nlyr(AMF_cube)
+names(AMF_cube)
+
+writeRaster(
+  AMF_cube,
+  filename = "../processed_data/complete_cube.tif",
+  overwrite = TRUE,
+  wopt = list(
+    gdal = c(
+      "BIGTIFF=YES",
+      "COMPRESS=LZW"
+    )
+  )
+)
+```
+## Confirming cube written to disk is correct
+
+```{r}
+complete_cube = rast("../processed_data/complete_cube.tif")
+
+complete_cube
+
+nlyr(complete_cube)
+```
+
