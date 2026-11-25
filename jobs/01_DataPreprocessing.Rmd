@@ -1,0 +1,889 @@
+---
+title: "Data Preprocessing"
+output: html_document
+date: "2026-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preface
+
+In `00_DataCollection.html`, we combined all of our data into a single data cube and ensured they had the same geometry, extent, reference system, etc. The goal in this script is to preprocess the data in `../processed_data/complete_cube.tif` in preparation for input into a neural network. Some of the processes will be centering and scaling continuous data and one-hot encoding categorical data.
+
+The main preliminary goals we want to get through are:
+1. Audit the AusAMF data: sample metadata, VT abundance matrix, taxonomy, and filtering information. Assess sampling structure: sequencing depth, read abundance, VT detections, sampling dates, coordinate precision, and spatial distribution.
+2. Prepare the response matrix: determine how to represent VT detections or abundances for modelling.
+3. Prepare environmental predictors: extract relevant information from `complete_cube.tif` at the sampling locations.
+4. Handle missing data and predictor types: assess scaling, categorical variables, and other preprocessing requirements.
+5. Construct the final NN inputs: create aligned predictor and response matrices, ready for model development.
+
+The assumed working directory is the `jobs` folder.
+
+```{r}
+library(terra)
+library(sf)
+library(tidyterra)
+library(dplyr)
+library(ggplot2)
+```
+
+## Projection Paths
+```{r}
+#Rorqual does not have internet access on the node I need, so I saved the tif grid for conversion to CRS 3577
+local_grid = file.path("/home/herna499/links/projects/def-jstinchc/herna499/proj_data")
+
+Sys.setenv(PROJ_DATA = local_grid)
+Sys.setenv(PROJ_LIB  = local_grid)
+Sys.setenv(PROJ_NETWORK = "OFF")
+Sys.setenv(GDAL_HTTP_MAX_RETRY = "0")
+
+message("PROJ Search Paths: ", paste(sf_proj_search_paths(), collapse = ", "))
+
+sf_proj_network(enable = FALSE)
+```
+
+## terra options
+
+```{r}
+# potential work around for R crashing. It shouldn't be a memory issue, but just in case, let's let terra use a temp directory and override the default terra limits by using BIGTIFF=YES.
+
+# Set temporary directory
+terra_tmp = "../processed_data/terra_temp"
+
+dir.create(
+  terra_tmp,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+terraOptions(
+  tempdir = terra_tmp,
+  memfrac = 0.5,
+  progress = 1
+)
+```
+
+## 1. AusAMF audit
+
+```{r}
+## Load data
+# AusAMF data
+abundance_matrix = read.csv(
+  "../raw_data/AusAMF/abundance_matrix.csv",
+  check.names = FALSE
+)
+
+sample_metadata = read.csv(
+  "../raw_data/AusAMF/sample_metadata.csv",
+  check.names = FALSE
+)
+
+VT_taxonomy = read.csv(
+  "../raw_data/AusAMF/VT_taxonomy.csv",
+  check.names = FALSE
+)
+
+filtering_info = read.csv(
+  "../raw_data/AusAMF/filtering_info.csv",
+  check.names = FALSE
+)
+
+# Environmental cube
+complete_cube = rast("../processed_data/complete_cube.tif")
+
+## Inspect basic structure
+dim(abundance_matrix)
+dim(sample_metadata)
+dim(VT_taxonomy)
+dim(filtering_info)
+
+head(abundance_matrix)
+head(sample_metadata)
+head(VT_taxonomy)
+head(filtering_info)
+
+complete_cube
+
+## Inspect column names and identifiers
+# Abundance matrix
+colnames(abundance_matrix)[1:10]
+rownames(abundance_matrix)[1:10]
+abundance_matrix[1:5, 1:8]
+
+# Sample metadata
+colnames(sample_metadata)
+sample_metadata[1:5, ]
+
+# VT taxonomy
+colnames(VT_taxonomy)
+VT_taxonomy[1:5, ]
+
+# Filtering information
+filtering_info
+```
+```{r}
+## Validate identifiers
+# Extract sample identifiers
+abundance_sample_ids = colnames(abundance_matrix)[-1]
+metadata_sample_ids = as.character(sample_metadata$sample_number)
+
+# Extract VT identifiers
+abundance_VT_ids = as.character(abundance_matrix[[1]])
+
+# Identify which taxonomy column contains the VT identifiers
+taxonomy_id_matches = sapply(
+  VT_taxonomy,
+  function(x) setequal(as.character(x), abundance_VT_ids)
+)
+
+# Check sample identifiers
+cat("Abundance samples:", length(abundance_sample_ids), "\n")
+cat("Metadata samples:", length(metadata_sample_ids), "\n")
+
+cat(
+  "Samples missing from metadata:",
+  length(setdiff(abundance_sample_ids, metadata_sample_ids)),
+  "\n"
+)
+
+cat(
+  "Samples missing from abundance matrix:",
+  length(setdiff(metadata_sample_ids, abundance_sample_ids)),
+  "\n"
+)
+
+cat(
+  "Duplicate abundance sample IDs:",
+  sum(duplicated(abundance_sample_ids)),
+  "\n"
+)
+
+cat(
+  "Duplicate metadata sample IDs:",
+  sum(duplicated(metadata_sample_ids)),
+  "\n"
+)
+
+# Check VT identifiers
+cat("\nVTs in abundance matrix:", length(abundance_VT_ids), "\n")
+cat("Duplicate VT IDs:", sum(duplicated(abundance_VT_ids)), "\n")
+
+cat("\nTaxonomy columns matching abundance VT IDs:\n")
+print(taxonomy_id_matches)
+#We expect VT_ID to be the only TRUE column
+```
+
+```{r}
+## Inspecting abundance data and sequencing stats
+# Convert abundance values to a numeric matrix
+abundance_values = as.matrix(abundance_matrix[, -1])
+storage.mode(abundance_values) = "numeric"
+
+# Basic summary
+summary(as.vector(abundance_values))
+
+# Check for missing and negative values
+sum(is.na(abundance_values))
+sum(abundance_values < 0, na.rm = TRUE)
+
+# Check zero and non-zero observations
+sum(abundance_values == 0, na.rm = TRUE)
+sum(abundance_values > 0, na.rm = TRUE)
+
+# Total reads per sample
+sample_read_totals = colSums(abundance_values)
+
+summary(sample_read_totals)
+
+# Number of detected VTs per sample
+sample_VT_richness = colSums(abundance_values > 0)
+
+summary(sample_VT_richness)
+```
+
+For this dataset, samples with no sequencing data will be treated as actual absences of AMF. Based on my reading of the original AusAMF paper, I believe the authors did actually confirm that the absence of sequencing data is not the result of poor extractions or sequencing mishaps.
+
+```{r}
+## Identify samples with zero reads. See note above this code chunk.
+
+# Identify samples with zero total reads
+zero_read_samples = names(sample_read_totals)[sample_read_totals == 0]
+
+length(zero_read_samples)
+
+# Inspect their metadata
+zero_read_metadata = sample_metadata[
+  sample_metadata$sample_number %in% zero_read_samples,
+]
+
+zero_read_metadata
+
+# Compare metadata completeness
+colSums(is.na(zero_read_metadata))
+
+# Compare the number of samples with and without reads
+table(sample_read_totals > 0)
+```
+
+```{r}
+# Compare sequencing totals from abundance matrix against metadata
+
+sequencing_check = data.frame(
+  sample_number = colnames(abundance_values),
+  matrix_reads = as.numeric(sample_read_totals)
+)
+
+sequencing_check = merge(
+  sequencing_check,
+  sample_metadata[, c(
+    "sample_number",
+    "cleaned_reads",
+    "total",
+    "total_reads",
+    "species_richness"
+  )],
+  by = "sample_number"
+)
+
+summary(sequencing_check)
+
+# Correlations between read-count measures
+cor(
+  sequencing_check[, c(
+    "matrix_reads",
+    "cleaned_reads",
+    "total",
+    "total_reads"
+  )],
+  use = "complete.obs"
+)
+```
+Data seems consistent between abundance matrix and metadata.
+
+```{r}
+## Sampling campaigns
+# Campaigns
+table(sample_metadata$sampling_campaign, useNA = "ifany")
+
+# Years
+table(sample_metadata$year, useNA = "ifany")
+
+# Quarters
+table(sample_metadata$quarter, useNA = "ifany")
+
+# Months
+table(sample_metadata$month, useNA = "ifany")
+
+# Campaign by year
+table(
+  sample_metadata$sampling_campaign,
+  sample_metadata$year,
+  useNA = "ifany"
+)
+
+summary(sample_metadata[, c("year", "quarter", "month")])
+```
+There is quite a bit of inconsistent sampling over time and across campaigns. This doesn't necessarily invalidate anything, but we should keep this in mind to make sure distributions aren't confounded by time and sampling campaign. In terms of quarters, it's pretty even across seasons with the exception of Q1.
+
+```{r}
+## Spatial structure
+# Coordinate summaries
+summary(sample_metadata[, c("latitude", "longitude")])
+
+# Check coordinate completeness
+sum(is.na(sample_metadata$latitude))
+sum(is.na(sample_metadata$longitude))
+
+# Check duplicate coordinates
+sum(duplicated(
+  sample_metadata[, c("latitude", "longitude")]
+))
+
+# Geographic ranges
+range(sample_metadata$latitude)
+range(sample_metadata$longitude)
+
+# Sampling campaign by geographic region
+# Geographic summary by sampling campaign
+sample_metadata %>%
+  group_by(sampling_campaign) %>%
+  summarise(
+    n_samples = n(),
+    latitude_min = min(latitude),
+    latitude_median = median(latitude),
+    latitude_max = max(latitude),
+    longitude_min = min(longitude),
+    longitude_median = median(longitude),
+    longitude_max = max(longitude)
+  )
+```
+Spatial extents for all data are within Australia. Some data points are spatially duplicated, but they may have been collected at different time points (checked in next chunk).
+
+There is some bias by sampling campaign. Campaign 1 has a more westernly median. The extents are similar so it may not be too bad, but spatial structure may be something to consider.
+
+```{r}
+## Duplicate coordinates
+duplicate_coordinates = sample_metadata %>%
+  group_by(latitude, longitude) %>%
+  filter(n() > 1) %>%
+  arrange(latitude, longitude) %>%
+  mutate(samples_at_location = n()) %>%
+  ungroup()
+
+duplicate_coordinates %>%
+  select(
+    latitude,
+    longitude,
+    sample_number,
+    sampling_campaign,
+    year,
+    samples_at_location
+  )
+
+duplicate_samples = sample_metadata %>%
+  group_by(latitude, longitude) %>%
+  filter(n() > 1) %>%
+  ungroup() %>%
+  select(
+    latitude,
+    longitude,
+    sample_number,
+    FASTQ_name,
+    sampling_campaign,
+    year,
+    month,
+    quarter,
+    soil_depth,
+    cleaned_reads,
+    total_reads,
+    species_richness
+  ) %>%
+  arrange(latitude, longitude, year, month)
+
+duplicate_samples
+
+# The duplicated samples were sampled at different times
+
+## Checking if duplicated samples have identical environmental data
+duplicate_samples_detail = sample_metadata %>%
+  group_by(latitude, longitude) %>%
+  filter(n() > 1) %>%
+  ungroup() %>%
+  select(
+    latitude,
+    longitude,
+    sample_number,
+    year,
+    month,
+    soil_depth,
+    MAT,
+    MAP,
+    elevation,
+    total_N,
+    pH_cacl,
+    totalP,
+    SOC,
+    avail_P
+  ) %>%
+  arrange(latitude, longitude, year, month)
+
+duplicate_samples_detail
+```
+No data are missing without a reason (zero-reads in a sample represents no AMF based on my reading of the original paper). Duplicated records are in fact separate temporal measurements of the same area.
+
+```{r}
+## Coordinate precision
+coordinate_precision = data.frame(
+  latitude = sample_metadata$latitude,
+  longitude = sample_metadata$longitude,
+  latitude_digits = nchar(sub(
+    "^[^.]*\\.?", "",
+    as.character(sample_metadata$latitude)
+  )),
+  longitude_digits = nchar(sub(
+    "^[^.]*\\.?", "",
+    as.character(sample_metadata$longitude)
+  ))
+)
+
+summary(coordinate_precision[, c(
+  "latitude_digits",
+  "longitude_digits"
+)])
+
+coordinate_precision_summary = coordinate_precision %>%
+  count(latitude_digits, longitude_digits) %>%
+  arrange(latitude_digits, longitude_digits) %>%
+  mutate(proportion = n / sum(n))
+
+coordinate_precision_summary
+```
+Precision of coordinates is pretty inconsistent. This might be okay on a continental scale, but something to keep in mind.
+
+### Audit summary
+Main takeaways
+- Dataset integrity: The abundance matrix contains 200 VTs across 610 samples. Sample and VT identifiers match the metadata and taxonomy tables, with no missing or duplicated identifiers.
+- Abundance and detection: Only 6.82% of VT–sample combinations have nonzero reads. Abundances and sequencing depths are highly uneven, with sample richness ranging from 0 to 62 VTs.
+- Zero-read samples: Nine samples have zero reads. I believe these are valid biological non-detections, not technical failures, and should be retained.
+- Sequencing metrics: Metadata total and total_reads agree with abundance-matrix read totals, and species_richness agrees with calculated richness. However, cleaned_reads represents a different metric and should not be used interchangeably.
+- Sampling campaigns: Campaign 1 contains 375 samples (2011–2021), while campaign 2 contains 235 samples (2022–2023). Campaign and year are completely confounded.
+- Geographic sampling bias: The campaigns have broadly overlapping geographic ranges but differ in their geographic distributions: campaign 1 is more westerly, while campaign 2 is more southerly.
+- Coordinate quality: All samples have coordinates, but precision varies substantially. Approximately 42% have seven displayed decimal places, while 32% have only one, introducing positional uncertainty.
+- Repeated coordinates: There are 34 samples sharing coordinates with other samples. They can have different collection dates and environmental measurements, so they should not automatically be aggregated or removed.
+Implications for modelling
+- Retain all 610 samples, including zero-read samples.
+- Preserve raw abundance and sequencing metadata.
+- Consider sequencing-depth effects on VT detection.
+- Do not automatically use campaign or year as ecological predictors.
+- Keep samples sharing coordinates together during spatial cross-validation.
+- Document coordinate uncertainty as a limitation.
+
+## 2. Preparing VT response matrix
+
+We want a binary response matrix of 1 (VT-detected; abundance > 0) and 0 (abundance = 0).
+
+```{r}
+## Build response matrix
+# Assign VT identifiers to rows
+rownames(abundance_values) = as.character(abundance_matrix[[1]])
+
+# Convert read counts to binary detections
+response_matrix = t(abundance_values > 0)
+
+# Convert logical values to integers (0/1)
+storage.mode(response_matrix) = "integer"
+
+# Assign sample and VT identifiers
+rownames(response_matrix) = colnames(abundance_values)
+colnames(response_matrix) = as.character(abundance_matrix[[1]])
+
+# Convert to data frame and add sample identifiers
+response_matrix = as.data.frame(response_matrix)
+
+response_matrix$sample_number = rownames(response_matrix)
+
+response_matrix = response_matrix %>%
+  select(sample_number, everything())
+
+dim(response_matrix)
+head(response_matrix[, 1:6])
+summary(rowSums(response_matrix[, -1]))
+```
+```{r}
+## VT prevalence (i.e., are taxa rare-biased or common-biased)
+# Calculate prevalence for each VT
+VT_prevalence = data.frame(
+  VT_ID = colnames(response_matrix)[-1],
+  n_presences = colSums(response_matrix[, -1]),
+  n_absences = nrow(response_matrix) -
+    colSums(response_matrix[, -1])
+) %>%
+  mutate(
+    prevalence = n_presences / nrow(response_matrix),
+    prevalence_percent = prevalence * 100
+  ) %>%
+  arrange(n_presences)
+
+# Summarise prevalence
+summary(VT_prevalence$n_presences)
+
+# Inspect the rarest and most common VTs
+head(VT_prevalence, 10)
+tail(VT_prevalence, 10)
+```
+Very sparse data. 31% of taxa occur in <= 5 samples. This can be a problem when we do spatial cross-validation because they may be entirely absent in the training datasets. It's possible that VTs show some level of endemism so they seem rare when thinking about them at a continental scale.
+
+```{r}
+# Join binary responses with sample coordinates
+response_spatial = response_matrix %>%
+  left_join(
+    sample_metadata %>%
+      select(sample_number, latitude, longitude),
+    by = "sample_number"
+  )
+
+# Count unique detection locations for each VT
+VT_ids = colnames(response_matrix)[-1]
+
+VT_spatial_prevalence = data.frame(
+  VT_ID = VT_ids,
+  n_presences = colSums(response_matrix[, VT_ids]),
+  n_unique_locations = sapply(VT_ids, function(vt) {
+    detected = response_spatial[response_spatial[[vt]] == 1, ]
+
+    nrow(unique(detected[, c("latitude", "longitude")]))
+  })
+)
+
+summary(VT_spatial_prevalence$n_unique_locations)
+head(VT_spatial_prevalence, 10)
+
+VT_spatial_prevalence = VT_spatial_prevalence %>%
+  mutate(
+    repeated_coordinate_detections =
+      n_presences - n_unique_locations
+  )
+
+summary(VT_spatial_prevalence$repeated_coordinate_detections)
+
+table(VT_spatial_prevalence$repeated_coordinate_detections)
+```
+Most taxa are not repeatedly occurring in the same location so duplicate sampling detected above is not likely to be an issue.
+
+```{r}
+## Assess sparsity
+total_presences = sum(response_matrix[, -1])
+total_combinations = 610 * 200
+
+c(
+  presences = total_presences,
+  absences = total_combinations - total_presences,
+  proportion_present = total_presences / total_combinations
+)
+```
+
+Matches what we expect from the OG abundance matrix.
+
+I don't want to remove the rare taxa (~5-20) just yet because we might end up with a bit of circularity downstream if they are really endemic. If there are less than 5, we strongly end up in a situation where we just don't have enough data.
+
+```{r}
+## Occurrence filter. remove taxa with fewer than 5 occurrences
+
+VT_prevalence = VT_prevalence %>%
+  mutate(
+    retain = n_presences >= 5
+  )
+
+table(VT_prevalence$retain)
+
+retained_VTs = VT_prevalence %>%
+  filter(retain) %>%
+  pull(VT_ID)
+
+response_matrix_filtered = response_matrix %>%
+  select(sample_number, all_of(retained_VTs))
+
+dim(response_matrix_filtered)
+
+# Occurence distribution
+summary(VT_prevalence$n_presences[VT_prevalence$retain])
+
+hist(
+  VT_prevalence$n_presences[VT_prevalence$retain],
+  breaks = 30,
+  main = "Prevalence of retained AMF VTs",
+  xlab = "Number of samples with detections"
+)
+```
+
+```{r}
+## Combine sample metadata with filtered response matrix
+modeling_samples = sample_metadata %>%
+  select(sample_number, latitude, longitude) %>%
+  left_join(
+    response_matrix_filtered,
+    by = "sample_number"
+  )
+
+## Check dimensions
+dim(modeling_samples)
+
+## Check sample identifiers
+sum(duplicated(modeling_samples$sample_number))
+
+## Check missing coordinates
+sum(is.na(modeling_samples$latitude))
+sum(is.na(modeling_samples$longitude))
+
+## Inspect
+head(modeling_samples[, 1:8])
+```
+
+## 3. Preparing environmental predictors
+
+```{r}
+## Check raster hasn't been overwritten or corrupted
+# Check raster CRS
+crs(complete_cube)
+
+# Create spatial points from sample coordinates
+modeling_points = vect(
+  modeling_samples,
+  geom = c("longitude", "latitude"),
+  crs = "EPSG:4326"
+)
+
+# Check point CRS
+crs(modeling_points)
+
+# Check raster CRS
+crs(complete_cube)
+```
+
+```{r}
+## reproject metadata coordinates to match raster's crs
+modeling_points_projected = project(
+  modeling_points,
+  crs(complete_cube)
+)
+
+# Check projected CRS
+crs(modeling_points_projected)
+
+# Inspect projected coordinates
+head(crds(modeling_points_projected))
+```
+
+I was very light-handed with the data collection earlier so the complete data cube has many uninformative layers. We will need to do quite a bit of auditing to make sure we only extract from informative layers.
+
+```{r}
+## Layer inventory
+# Create an inventory of raster layers
+layer_inventory = data.frame(
+  layer_index = 1:nlyr(complete_cube),
+  layer_name = names(complete_cube)
+) %>%
+  mutate(
+    prefix = sub("_.*", "", layer_name)
+  )
+
+# Inspect all layer names, grouped by prefix
+layer_inventory = layer_inventory %>%
+  arrange(prefix, layer_index)
+
+print(layer_inventory, row.names = FALSE)
+
+# Count layers by prefix
+table(layer_inventory$prefix)
+```
+
+```{r}
+# Inspect raster layer data types
+layer_types = data.frame(
+  layer_name = names(complete_cube),
+  datatype = sapply(
+    1:nlyr(complete_cube),
+    function(i) datatype(complete_cube[[i]])
+  )
+)
+
+# Inspect data types by layer
+print(layer_types, row.names = FALSE)
+
+# Count layers by data type
+table(layer_types$datatype)
+```
+```{r}
+## Let's start clearing up the NVIS data. There is a lot of uninformative info.
+## Let's read in the OG dataset to get the `NV_Details` table.
+
+# NVIS source data
+gdb_path = "../raw_data/NVIS_V7/NVIS_V7_0_VECTOR_STATE_FILES_EXT.gdb/"
+
+# Inspect available layers
+NV_avail_layers = st_layers(gdb_path)
+
+NV_avail_layers$name
+
+# Load NVIS lookup tables
+NV_details = as.data.frame(
+  vect(gdb_path, layer = NV_avail_layers$name[9])
+)
+
+NV_flat = as.data.frame(
+  vect(gdb_path, layer = NV_avail_layers$name[10])
+)
+
+# Inspect dimensions
+dim(NV_details)
+dim(NV_flat)
+
+# Inspect field names
+names(NV_details)
+names(NV_flat)
+```
+```{r}
+## How much data is available for us to look at?
+# Inspect completeness of classification levels
+NV_classification_fields = c(
+  "L1_CLASS",
+  "L2_STRUCTURAL_FORMATION",
+  "L3_BROAD_FLORISTIC_FORMATION",
+  "L4_SUB_FORMATION",
+  "L5_ASSOCIATION",
+  "L6_SUB_ASSOCIATION"
+)
+
+data.frame(
+  field = NV_classification_fields,
+  unique_values = sapply(
+    NV_details[NV_classification_fields],
+    function(x) length(unique(na.omit(x)))
+  ),
+  missing_values = sapply(
+    NV_details[NV_classification_fields],
+    function(x) sum(is.na(x))
+  ),
+  missing_percent = sapply(
+    NV_details[NV_classification_fields],
+    function(x) mean(is.na(x)) * 100
+  )
+)
+
+# All 6 NVIS classification levels are complete.
+# L1 and L2 might be more useful for our purposes because the higher level classifications might be too granular and we don't have the data to take advantage of it.
+
+# How does the lookup table connect with original polygon attributes?
+NV_ACT = vect(
+  gdb_path,
+  layer = "NVIS7_0_AUST_EXT_ACT",
+  proxy = TRUE
+)
+
+names(NV_ACT)
+
+## There is no clear NVIS_ID field. Is it MAPUNT_IDENTIFIER?
+# Read ACT attributes without retaining polygon geometry
+NV_ACT_attributes = as.data.frame(
+  vect(
+    gdb_path,
+    layer = "NVIS7_0_AUST_EXT_ACT"
+  ),
+  geom = NULL
+)
+
+# Compare identifier values
+data.frame(
+  field = c("MAPUNT_IDENTIFIER", "NVIS_ID"),
+  example_values = c(
+    paste(head(unique(NV_ACT_attributes$MAPUNT_IDENTIFIER), 5), collapse = "; "),
+    paste(head(NV_details$NVIS_ID, 5), collapse = "; ")
+  )
+)
+
+c(
+  MAPUNT_matches_details = sum(
+    NV_ACT_attributes$MAPUNT_IDENTIFIER %in% NV_details$NVIS_ID,
+    na.rm = TRUE
+  ),
+  MAPUNT_matches_flat = sum(
+    NV_ACT_attributes$MAPUNT_IDENTIFIER %in% NV_flat$NVIS_ID,
+    na.rm = TRUE
+  ),
+  ACT_records = nrow(NV_ACT_attributes)
+)
+
+# NVIS_ID and MAPUNT_IDENTIFIER are not the same
+
+## Are the 6 NVISDSC fields the same as those in NV_details?
+# Compare polygon and lookup values for the first classification level
+data.frame(
+  source = c("ACT polygons", "NV_details"),
+  example_values = c(
+    paste(
+      head(unique(NV_ACT_attributes$NVISDSC1), 10),
+      collapse = "; "
+    ),
+    paste(
+      head(unique(NV_details$L1_CLASS), 10),
+      collapse = "; "
+    )
+  )
+)
+
+# Count matching classification values
+sum(
+  unique(NV_ACT_attributes$NVISDSC1) %in% NV_details$L1_CLASS,
+  na.rm = TRUE
+)
+
+length(unique(na.omit(NV_ACT_attributes$NVISDSC1)))
+
+# NV_details$L1_class is a highly descriptive label while NVIS_ID is a numeric label. This is not joining scheme.
+
+# Check whether NVISDSC1 codes match lookup identifiers
+c(
+  matches_NVIS_ID = sum(
+    unique(NV_ACT_attributes$NVISDSC1) %in% NV_details$NVIS_ID,
+    na.rm = TRUE
+  ),
+  matches_SOURCE_CODE = sum(
+    unique(NV_ACT_attributes$NVISDSC1) %in% NV_details$SOURCE_CODE,
+    na.rm = TRUE
+  )
+)
+
+# Inspect the relevant lookup-table fields
+head(
+  NV_details[, c(
+    "NVIS_ID",
+    "SOURCE_CODE",
+    "LEVEL_OF_DETAIL",
+    "L1_CLASS",
+    "MVG_NUMBER"
+  )],
+  10
+)
+```
+
+`NVISDSC1-NVISDSC6` contain NVIS_ID values, and those values match `NV_details$NVIS_ID`. All 8,060 distinct ACT NVISDSC1 codes matched the lookup table.
+
+We can translate the numeric raster codes into vegetation classifications using NV_details. We can also potentially derive broader vegetation predictors from the finer classifications, such as MVG_NUMBER, MVG_NAME, and the L1–L6 hierarchy.
+
+```{r}
+## Confirm that six NVIS classifications match up to the lookup table
+# Check all six NVIS classification fields against the lookup table
+NVIS_match_check = data.frame(
+  field = paste0("NVISDSC", 1:6),
+  unique_codes = sapply(
+    NV_ACT_attributes[paste0("NVISDSC", 1:6)],
+    function(x) length(unique(na.omit(x)))
+  ),
+  matched_codes = sapply(
+    NV_ACT_attributes[paste0("NVISDSC", 1:6)],
+    function(x) {
+      sum(
+        unique(na.omit(x)) %in% NV_details$NVIS_ID
+      )
+    }
+  )
+)
+
+NVIS_match_check
+```
+
+ACT may not have resolution at all those other layers. Let's just check all the states.
+
+```{r}
+# Inspect classification coverage across all states and territories
+NV_state_layers = NV_avail_layers$name[1:8]
+
+NVIS_state_coverage = lapply(NV_state_layers, function(layer_name) {
+
+  NV_attributes = as.data.frame(
+    vect(gdb_path, layer = layer_name),
+    geom = NULL
+  )
+
+  data.frame(
+    state = sub("NVIS7_0_AUST_EXT_", "", layer_name),
+    records = nrow(NV_attributes),
+    t(sapply(
+      paste0("NVISDSC", 1:6),
+      function(field) {
+        c(
+          populated = sum(!is.na(NV_attributes[[field]])),
+          unique_codes = length(unique(na.omit(NV_attributes[[field]])))
+        )
+      }
+    ))
+  )
+})
+
+NVIS_state_coverage = bind_rows(NVIS_state_coverage)
+
+NVIS_state_coverage
+```
+
