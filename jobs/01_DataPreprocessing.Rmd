@@ -27,6 +27,7 @@ library(sf)
 library(tidyterra)
 library(dplyr)
 library(ggplot2)
+library(stringr)
 ```
 
 ## Projection Paths
@@ -857,33 +858,1166 @@ NVIS_match_check
 ACT may not have resolution at all those other layers. Let's just check all the states.
 
 ```{r}
-# Inspect classification coverage across all states and territories
+## Testing to limit RAM usage by not loading all the polygons into memory and instead searching with SQL
+# Count populated and distinct NVISDSC1 identifiers directly in the geodatabase
+NV_NSW_test = st_read(
+  gdb_path,
+  query = paste(
+    "SELECT",
+    "COUNT(NVISDSC1) AS populated,",
+    "COUNT(DISTINCT NVISDSC1) AS unique_codes",
+    "FROM NVIS7_0_AUST_EXT_NSW"
+  ),
+  quiet = TRUE
+)
+
+st_drop_geometry(NV_NSW_test)
+
+# Summarize all six NVIS classification fields in NSW
+NV_NSW_summary = st_read(
+  gdb_path,
+  query = paste(
+    "SELECT",
+    "COUNT(NVISDSC1) AS NVISDSC1_populated,",
+    "COUNT(DISTINCT NVISDSC1) AS NVISDSC1_unique,",
+    "COUNT(NVISDSC2) AS NVISDSC2_populated,",
+    "COUNT(DISTINCT NVISDSC2) AS NVISDSC2_unique,",
+    "COUNT(NVISDSC3) AS NVISDSC3_populated,",
+    "COUNT(DISTINCT NVISDSC3) AS NVISDSC3_unique,",
+    "COUNT(NVISDSC4) AS NVISDSC4_populated,",
+    "COUNT(DISTINCT NVISDSC4) AS NVISDSC4_unique,",
+    "COUNT(NVISDSC5) AS NVISDSC5_populated,",
+    "COUNT(DISTINCT NVISDSC5) AS NVISDSC5_unique,",
+    "COUNT(NVISDSC6) AS NVISDSC6_populated,",
+    "COUNT(DISTINCT NVISDSC6) AS NVISDSC6_unique",
+    "FROM NVIS7_0_AUST_EXT_NSW"
+  ),
+  quiet = TRUE
+)
+
+st_drop_geometry(NV_NSW_summary)
+
+## Okay, we've confirmed that resolution in terms of NVIS descriptions is not the same across all states and that this SQL strategy limits RAM usage. Repeat for all 8 states.
+```
+```{r}
+# Summarize NVIS classification coverage across all jurisdictions
 NV_state_layers = NV_avail_layers$name[1:8]
 
 NVIS_state_coverage = lapply(NV_state_layers, function(layer_name) {
 
-  NV_attributes = as.data.frame(
-    vect(gdb_path, layer = layer_name),
-    geom = NULL
+  query_fields = unlist(lapply(1:6, function(i) {
+    field = paste0("NVISDSC", i)
+
+    c(
+      paste0("COUNT(", field, ") AS ", field, "_populated"),
+      paste0("COUNT(DISTINCT ", field, ") AS ", field, "_unique")
+    )
+  }))
+
+  query = paste(
+    "SELECT",
+    paste(query_fields, collapse = ", "),
+    "FROM",
+    layer_name
   )
 
-  data.frame(
-    state = sub("NVIS7_0_AUST_EXT_", "", layer_name),
-    records = nrow(NV_attributes),
-    t(sapply(
-      paste0("NVISDSC", 1:6),
-      function(field) {
-        c(
-          populated = sum(!is.na(NV_attributes[[field]])),
-          unique_codes = length(unique(na.omit(NV_attributes[[field]])))
-        )
-      }
-    ))
+  result = st_read(
+    gdb_path,
+    query = query,
+    quiet = TRUE
   )
+
+  result = st_drop_geometry(result)
+
+  result$state = sub("NVIS7_0_AUST_EXT_", "", layer_name)
+
+  result
 })
 
-NVIS_state_coverage = bind_rows(NVIS_state_coverage)
+NVIS_state_coverage = bind_rows(NVIS_state_coverage) %>%
+  select(state, everything())
 
 NVIS_state_coverage
 ```
 
+The takeaway here is that depth of classification is inconsistent across states. We can use NVISDSC1 for all states, maybe use NVISDSC2 as supplementary information. Level 3 might be too inconsistent/patchy. Levels 4-6 will be unusable. So, moving forward, we will definitely use Level 1. Level 2 might be usable. We will determine this later.
+
+```{r}
+# Summarize the classification categories in the NVIS lookup table
+NVIS_lookup_summary = data.frame(
+  field = c(
+    "L1_CLASS",
+    "L2_STRUCTURAL_FORMATION",
+    "L3_BROAD_FLORISTIC_FORMATION",
+    "MVG_NAME",
+    "MVS_NAME"
+  ),
+  unique_categories = sapply(
+    NV_details[c(
+      "L1_CLASS",
+      "L2_STRUCTURAL_FORMATION",
+      "L3_BROAD_FLORISTIC_FORMATION",
+      "MVG_NAME",
+      "MVS_NAME"
+    )],
+    function(x) length(unique(na.omit(x)))
+  )
+)
+
+NVIS_lookup_summary
+
+## L1 is definitely usable and has pretty fine detailing of categories with 73 unique categories for vegetation class. L2 might be a little harder to use with 610 data points. L3 is unusable. MVG and MVS will definitely be usable, but let's confirm it's coverage (how many entries have valid MVG and MVS labels).
+```
+
+```{r}
+# Examine completeness and category counts for MVG and MVS
+data.frame(
+  field = c("MVG_NUMBER", "MVG_NAME", "MVS_NUMBER", "MVS_NAME"),
+  populated = sapply(
+    NV_details[c("MVG_NUMBER", "MVG_NAME", "MVS_NUMBER", "MVS_NAME")],
+    function(x) sum(!is.na(x))
+  ),
+  unique_categories = sapply(
+    NV_details[c("MVG_NUMBER", "MVG_NAME", "MVS_NUMBER", "MVS_NAME")],
+    function(x) length(unique(na.omit(x)))
+  )
+)
+
+## MVG and MVS are all complete with no missing values. *cue the fireworks*
+```
+
+```{r}
+## Are any polygons missing MVG and MVS values?
+# Extract distinct NSW NVISDSC1 identifiers using GDAL SQL
+NV_NSW_ids = st_read(
+  gdb_path,
+  query = paste(
+    "SELECT DISTINCT NVISDSC1",
+    "FROM NVIS7_0_AUST_EXT_NSW",
+    "WHERE NVISDSC1 IS NOT NULL"
+  ),
+  quiet = TRUE
+)
+
+NV_NSW_ids = st_drop_geometry(NV_NSW_ids)
+
+# Check lookup matches
+c(
+  NSW_unique_ids = nrow(NV_NSW_ids),
+  matched_lookup_ids = sum(
+    NV_NSW_ids$NVISDSC1 %in% NV_details$NVIS_ID
+  )
+)
+
+# Join NSW classification IDs to the NVIS lookup table
+NV_NSW_lookup = NV_NSW_ids %>%
+  left_join(
+    NV_details %>%
+      select(NVIS_ID, MVG_NUMBER, MVG_NAME, MVS_NUMBER, MVS_NAME),
+    by = c("NVISDSC1" = "NVIS_ID")
+  )
+
+# Count represented MVG and MVS categories (take-away: NSW has high representation of most MVGs and MVSs)
+data.frame(
+  classification = c("MVG", "MVS"),
+  unique_categories = c(
+    n_distinct(NV_NSW_lookup$MVG_NUMBER),
+    n_distinct(NV_NSW_lookup$MVS_NUMBER)
+  )
+)
+
+# Check completeness of the NSW MVG and MVS classifications (take-away: no missing data)
+data.frame(
+  field = c("MVG_NUMBER", "MVG_NAME", "MVS_NUMBER", "MVS_NAME"),
+  missing = sapply(
+    NV_NSW_lookup[c("MVG_NUMBER", "MVG_NAME", "MVS_NUMBER", "MVS_NAME")],
+    function(x) sum(is.na(x))
+  )
+)
+
+# Retrieve distinct NVISDSC1 identifiers for each jurisdiction
+NVIS_state_ids = lapply(NV_state_layers, function(layer_name) {
+
+  ids = st_read(
+    gdb_path,
+    query = paste(
+      "SELECT DISTINCT NVISDSC1",
+      "FROM", layer_name,
+      "WHERE NVISDSC1 IS NOT NULL"
+    ),
+    quiet = TRUE
+  )
+
+  ids = st_drop_geometry(ids)
+
+  data.frame(
+    state = sub("NVIS7_0_AUST_EXT_", "", layer_name),
+    unique_ids = nrow(ids),
+    matched_ids = sum(ids$NVISDSC1 %in% NV_details$NVIS_ID)
+  )
+})
+
+NVIS_state_id_coverage = bind_rows(NVIS_state_ids)
+
+NVIS_state_id_coverage
+
+
+## Repeat for the whole dataset
+# Summarize MVG and MVS diversity across jurisdictions (take-away: the MVG and MVS classifications are broadly represented across states!!!! Yay!)
+NVIS_state_vegetation = lapply(NV_state_layers, function(layer_name) {
+
+  ids = st_read(
+    gdb_path,
+    query = paste(
+      "SELECT DISTINCT NVISDSC1",
+      "FROM", layer_name,
+      "WHERE NVISDSC1 IS NOT NULL"
+    ),
+    quiet = TRUE
+  )
+
+  ids = st_drop_geometry(ids)
+
+  lookup = ids %>%
+    left_join(
+      NV_details %>%
+        select(NVIS_ID, MVG_NUMBER, MVS_NUMBER),
+      by = c("NVISDSC1" = "NVIS_ID")
+    )
+
+  data.frame(
+    state = sub("NVIS7_0_AUST_EXT_", "", layer_name),
+    MVG_categories = n_distinct(lookup$MVG_NUMBER),
+    MVS_categories = n_distinct(lookup$MVS_NUMBER)
+  )
+})
+
+NVIS_state_vegetation = bind_rows(NVIS_state_vegetation)
+
+NVIS_state_vegetation
+
+## Find the layer that matches the NVISDSC1 values in the complete_cube raster that can be matched to an MVG. We can use MVS as supplementary information but not as an independent variable because MVG and MVS are related hierarchically
+# Inspect the existing NVIS raster layers
+NVIS_raster_names = names(complete_cube)[
+  grepl("^(ACT|NSW|NT|QLD|SA|TAS|VIC|WA)_", names(complete_cube))
+]
+
+data.frame(
+  layer = NVIS_raster_names,
+  datatype = datatype(
+    complete_cube[[NVIS_raster_names]]
+  )
+)
+
+## Let's see if we can get the original layer names from the original NV_cube
+
+# Load the original NVIS raster cube
+NV_cube = rast("../processed_data/rasters/NV_cube.tif")
+
+# Inspect the original layer names
+data.frame(
+  layer_number = seq_len(nlyr(NV_cube)),
+  layer_name = names(NV_cube)
+)
+
+## We removed the attribute names when building the raster. That's okay, we can replicate the naming logic from 00_DataCollection.Rmd.
+# Read the Tasmania layer schema only
+NV_TAS_schema = st_read(
+  gdb_path,
+  query = paste(
+    "SELECT *",
+    "FROM NVIS7_0_AUST_EXT_TAS",
+    "WHERE 1 = 0"
+  ),
+  quiet = TRUE
+)
+
+# Inspect field names and types
+data.frame(
+  field = names(st_drop_geometry(NV_TAS_schema)),
+  class = vapply(
+    st_drop_geometry(NV_TAS_schema),
+    function(x) class(x)[1],
+    character(1)
+  )
+)
+
+## NVISDSC1 will be the 2nd layer. VEGPROP1 will be the 8th layer. Integer layers come first based on how we built the raster.
+```
+I think I was over-complicating this a bit. A cleaner approach is to determine if we can pull the NVISDSC1 layers from the raster and then pull the MVG and MVS values from the `NV_details` look-up table
+
+```{r}
+# Check whether each NVIS_ID maps to one MVG and MVS
+NV_lookup_check = NV_details %>%
+  group_by(NVIS_ID) %>%
+  summarise(
+    n_MVG = n_distinct(MVG_NUMBER),
+    n_MVS = n_distinct(MVS_NUMBER),
+    .groups = "drop"
+  )
+
+# Summarise lookup consistency
+data.frame(
+  total_NVIS_IDs = nrow(NV_lookup_check),
+  multiple_MVG = sum(NV_lookup_check$n_MVG > 1),
+  multiple_MVS = sum(NV_lookup_check$n_MVS > 1),
+  missing_MVG = sum(NV_lookup_check$n_MVG == 0),
+  missing_MVS = sum(NV_lookup_check$n_MVS == 0)
+)
+
+## Okay. The lookup is complete and unambiguous.
+
+# Create a lookup table for vegetation classifications
+NV_vegetation_lookup = NV_details %>%
+  select(
+    NVIS_ID,
+    MVG_NUMBER,
+    MVG_NAME,
+    MVS_NUMBER,
+    MVS_NAME
+  ) %>%
+  distinct()
+
+# Verify lookup dimensions and uniqueness
+stopifnot(
+  nrow(NV_vegetation_lookup) == n_distinct(NV_vegetation_lookup$NVIS_ID)
+)
+
+dim(NV_vegetation_lookup)
+
+# Summarise the national MVG classification (take-away: a value of 99 should be treated as unknown/NA)
+NV_vegetation_lookup %>%
+  distinct(MVG_NUMBER, MVG_NAME) %>%
+  arrange(MVG_NUMBER)
+
+# Inspect unique values in the Tasmania NVISDSC1 raster (take-away: We have 152 unique values here in the raster but 157 in the polygon. This is close enough and likely okay because some polygons may have been too small)
+NV_TAS_DSC1 = NV_cube[["TAS_2"]]
+
+freq(NV_TAS_DSC1)
+
+# Compare rasterized Tasmania identifiers with the NVIS lookup table
+TAS_raster_ids = freq(NV_TAS_DSC1)$value
+TAS_vector_ids = unique(NV_details$NVIS_ID[
+  NV_details$NVIS_ID %in% TAS_raster_ids
+])
+
+# Check for raster identifiers missing from the lookup table
+TAS_unmatched_ids = setdiff(TAS_raster_ids, NV_details$NVIS_ID)
+
+# Check for lookup identifiers absent from the raster (take-away: we can find all NVISDSC1 classifiers in the lookup table! The 19282 missing ids is okay because the lookup table is for all of Australia and those are likely just not present in Tasmania but present elsewhere in Australia)
+TAS_absent_ids = setdiff(
+  unique(NV_details$NVIS_ID),
+  TAS_raster_ids
+)
+
+length(TAS_raster_ids)
+length(TAS_unmatched_ids)
+TAS_unmatched_ids
+length(TAS_absent_ids)
+
+# Create a lookup table for Tasmania's rasterized NVIS identifiers
+TAS_MVG_lookup = NV_details %>%
+  filter(NVIS_ID %in% TAS_raster_ids) %>%
+  select(NVIS_ID, MVG_NUMBER, MVG_NAME) %>%
+  distinct() %>%
+  arrange(MVG_NUMBER)
+
+# Inspect the resulting lookup table
+dim(TAS_MVG_lookup)
+TAS_MVG_lookup
+
+# Count unique MVG categories represented in Tasmania
+TAS_MVG_lookup %>%
+  distinct(MVG_NUMBER, MVG_NAME) %>%
+  arrange(MVG_NUMBER)
+
+# Count how many NVIS identifiers map to each MVG
+TAS_MVG_lookup %>%
+  count(MVG_NUMBER, MVG_NAME, name = "n_NVIS_IDs") %>%
+  arrange(MVG_NUMBER)
+```
+
+Main take-aways are that we can use the 2nd layer for each state to get the NVISDSC1 ID which we can then use to extract the MVG and MVS layers from the lookup table `NV_details`. We should also treat 99 as an NA.
+
+```{r}
+# Check the number of raster layers per jurisdiction (take-away all state layers were constructed the same way. I thought so, but I just wanted to make sure.)
+NV_state_layer_counts = c(
+  TAS = nlyr(NV_cube[[grep("^TAS_", names(NV_cube))]]),
+  ACT = nlyr(NV_cube[[grep("^ACT_", names(NV_cube))]]),
+  NSW = nlyr(NV_cube[[grep("^NSW_", names(NV_cube))]]),
+  NT  = nlyr(NV_cube[[grep("^NT_", names(NV_cube))]]),
+  QLD = nlyr(NV_cube[[grep("^QLD_", names(NV_cube))]]),
+  SA  = nlyr(NV_cube[[grep("^SA_", names(NV_cube))]]),
+  WA  = nlyr(NV_cube[[grep("^WA_", names(NV_cube))]]),
+  VIC = nlyr(NV_cube[[grep("^VIC_", names(NV_cube))]])
+)
+
+NV_state_layer_counts
+
+# Identify the NVISDSC1 layers in the complete environmental cube
+grep(
+  "^(TAS|ACT|NSW|NT|QLD|SA|WA|VIC)_2$",
+  names(complete_cube),
+  value = TRUE
+)
+
+# Extract NVISDSC1 layers from the complete environmental cube
+NV_DSC1 = complete_cube[[
+  c("TAS_2", "ACT_2", "NSW_2", "NT_2",
+    "QLD_2", "SA_2", "WA_2", "VIC_2")
+]]
+
+# Combine the eight jurisdictions into one national raster
+NV_DSC1_national = NV_DSC1[[1]]
+
+for (i in 2:nlyr(NV_DSC1)) {
+  NV_DSC1_national = cover(NV_DSC1_national, NV_DSC1[[i]])
+}
+
+names(NV_DSC1_national) = "NVIS_ID"
+
+NV_DSC1_national
+
+# Create a lookup table for converting NVIS_ID to MVG_NUMBER
+NV_MVG_lookup = NV_details %>%
+  select(NVIS_ID, MVG_NUMBER) %>%
+  distinct() %>%
+  filter(!is.na(MVG_NUMBER), MVG_NUMBER != 99)
+
+# Confirm lookup uniqueness
+nrow(NV_MVG_lookup)
+n_distinct(NV_MVG_lookup$NVIS_ID)
+
+# Convert the NVIS_ID raster into an MVG_NUMBER raster
+NV_MVG_national = subst(
+  NV_DSC1_national,
+  from = NV_MVG_lookup$NVIS_ID,
+  to = NV_MVG_lookup$MVG_NUMBER
+)
+
+names(NV_MVG_national) = "NV_MVG"
+
+# Inspect the resulting raster (take-away some of the values do not match the MVG codes. These are likely NVISDSC1 values that match to MVG99 which we excluded from the lookup table. We should convert them to NAs)
+NV_MVG_national
+freq(NV_MVG_national)
+
+# Identify values that are not valid MVG codes
+NV_MVG_freq = freq(NV_MVG_national)
+
+NV_invalid_values = setdiff(
+  NV_MVG_freq$value,
+  unique(NV_MVG_lookup$MVG_NUMBER)
+)
+
+# Replace remaining NVIS identifiers with NA
+NV_MVG_national = subst(
+  NV_MVG_national,
+  from = NV_invalid_values,
+  to = NA
+)
+
+# Inspect the cleaned raster
+freq(NV_MVG_national)
+
+# Calculate the proportion of cells with valid MVG classifications
+NV_MVG_valid_cells = global(!is.na(NV_MVG_national), "sum", na.rm = TRUE)[1, 1]
+
+NV_MVG_total_cells = ncell(NV_MVG_national)
+
+NV_MVG_missing_cells = NV_MVG_total_cells - NV_MVG_valid_cells
+
+data.frame(
+  total_cells = NV_MVG_total_cells,
+  valid_cells = NV_MVG_valid_cells,
+  missing_cells = NV_MVG_missing_cells,
+  percent_valid = 100 * NV_MVG_valid_cells / NV_MVG_total_cells
+)
+```
+
+A lot of cells don't have a valid MVG attribute. Why? Is it possible these are all clustered in a weird area like the desert?
+
+```{r}
+# Create a binary raster indicating MVG coverage
+NV_MVG_coverage = ifel(
+  is.na(NV_MVG_national),
+  0,
+  1
+)
+
+names(NV_MVG_coverage) = "MVG_coverage"
+
+# Aggregate to a coarser resolution for visualization
+NV_MVG_coverage_plot = aggregate(
+  NV_MVG_coverage,
+  fact = 8,
+  fun = mean,
+  na.rm = FALSE
+)
+
+# Convert to a data frame for plotting
+NV_MVG_plot_df = as.data.frame(
+  NV_MVG_coverage_plot,
+  xy = TRUE,
+  na.rm = FALSE
+)
+
+head(NV_MVG_plot_df)
+
+ggplot(
+  NV_MVG_plot_df,
+  aes(x = x, y = y, fill = MVG_coverage)
+) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_gradient(
+    low = "grey90",
+    high = "darkgreen",
+    limits = c(0, 1),
+    name = "MVG coverage"
+  ) +
+  labs(
+    title = "Spatial coverage of NVIS Major Vegetation Groups",
+    subtitle = "Proportion of original raster cells with an assigned MVG",
+    x = "Easting (m)",
+    y = "Northing (m)"
+  ) +
+  theme_minimal()
+```
+
+The high missingness in the raster is actually mostly ocean. Let's assess how much missing data there is terrestrially using the IBRA raster as a mask.
+
+```{r}
+IBRA_land_mask = complete_cube[["IB_IBRA_ID"]]
+
+NV_MVG_land_coverage = ifel(
+  !is.na(IBRA_land_mask),
+  ifel(!is.na(NV_MVG_national), 1, 0),
+  NA
+)
+
+global(
+  NV_MVG_land_coverage,
+  fun = "mean",
+  na.rm = TRUE
+)
+```
+Yep. Most of the missingness was from the oceans. We are only missing like .11% of terrestrial cells. MVG values are usable!
+
+I think we can say we've finished the audit for NVIS.
+
+```{r}
+## let's check the forest related layers
+FOR_TEN = complete_cube[["FOR_TEN"]]
+
+is.factor(FOR_TEN)
+levels(FOR_TEN)
+freq(FOR_TEN)
+
+## Weird. some labels in the frequency table occur more than once...
+
+# Inspect the raster values
+FOR_values = values(FOR_TEN, mat = FALSE)
+
+table(FOR_values, useNA = "always")
+
+# Inspect the lookup table, if available
+levels(FOR_TEN)
+
+## Where did FOR_TEN come from?
+FOR_TEN = complete_cube[["FOR_TEN"]]
+
+sources(FOR_TEN)
+describe(FOR_TEN)
+```
+Something happened with reading in the fire history data. That is `FOR_TEN`. Let's check where it went wrong and correct it if necessary here.
+
+```{r}
+fire_source = rast("../raw_data/fire/GeoTIFF/fire_for16-21.tif")
+
+nlyr(fire_source)
+names(fire_source)
+sources(fire_source)
+describe(fire_source)
+
+## Woops. I misunderstood the original structure of the fire history raster. I thought it had multiple layers for different years, but it was actually a single band raster and that band was called FOR_TEN.
+
+# Inspect attribute table
+fire_attributes = read.csv(
+  "../raw_data/fire/GeoTIFF/Fire_For16-21_Attributes.csv"
+)
+
+dim(fire_attributes)
+names(fire_attributes)
+head(fire_attributes)
+
+## I see where I got confused. The attribute data has the info from multiple years. It wasn't in separate layers.
+```
+
+In retrospect, The fire history is so short in timescale that it doesn't make sense to include. let's remove it from `complete_cube`.
+
+```{r}
+## Remove fire raster identifier
+complete_cube = complete_cube[[names(complete_cube) != "FOR_TEN"]]
+```
+
+I think we're in the clear to just start extracting data.
+
+```{r}
+# Select all AA and TE layers
+aa_te_layers = names(complete_cube)[
+  startsWith(names(complete_cube), "AA_") |
+  startsWith(names(complete_cube), "TE_")
+]
+
+# Specify the additional layers to extract
+required_layers = c(
+  "IB_IBRA_ID",
+  "IU_ID_TYPE",
+  "IU_ID_NAME",
+  "IU_ID_MGT_PLAN",
+  "IU_ID_ZONE_TYPE",
+  "SA_ID_mapsymbol"
+)
+
+# Check that all requested layers exist
+missing_layers = setdiff(required_layers, names(complete_cube))
+
+if (length(missing_layers) > 0) {
+  stop("Missing requested layers: ", paste(missing_layers, collapse = ", "))
+}
+
+# Combine the selected layer names
+selected_layers = c(aa_te_layers, required_layers)
+
+# Extract selected environmental values
+environmental_extraction = terra::extract(
+  complete_cube[[selected_layers]],
+  modeling_points_projected
+)
+
+# Check that extraction rows align with the samples
+stopifnot(
+  nrow(environmental_extraction) == nrow(modeling_samples),
+  all(environmental_extraction$ID == seq_len(nrow(modeling_samples)))
+)
+
+# Remove the extraction ID column
+environmental_values = environmental_extraction[, -1]
+
+# Add sample identifiers
+environmental_values = bind_cols(
+  modeling_samples %>% select(sample_number),
+  environmental_values
+)
+
+# Inspect the result
+dim(environmental_values)
+names(environmental_values)
+head(environmental_values[, 1:8])
+```
+
+```{r}
+# Inspect unique geological-period values
+sort(unique(environmental_values$SA_ID_mapsymbol))
+
+# Summarize the extracted values
+summary(environmental_values$SA_ID_mapsymbol)
+
+# Check how many samples have missing values
+sum(is.na(environmental_values$SA_ID_mapsymbol))
+
+## Rebuild integer mapping
+# read in original soil age raster
+surf_age = terra::vect("../raw_data/soil_age/AUS_GA_2500k_GUPoly_Age.shp")
+
+# inspect
+surf_age
+names(surf_age)
+
+# Rebuild alphabetical integer labels
+mapsymbol_levels = levels(factor(surf_age$mapsymbol))
+
+geo_categories = data.frame(
+  mapsymbol = mapsymbol_levels,
+  integer_label = seq_along(mapsymbol_levels)
+)
+
+# Assign geological midpoint ages in Ma
+geo_categories = geo_categories %>%
+  mutate(
+    clean_label = stringr::str_trim(mapsymbol),
+    age_Ma = case_when(
+      str_starts(clean_label, "-P") |
+        str_detect(clean_label, "- -P") ~ 1500.0,
+      str_starts(clean_label, "A")  ~ 3000.0,
+      str_starts(clean_label, "CP") ~ 328.9,
+      str_starts(clean_label, "C")  ~ 512.1,
+      str_starts(clean_label, "D")  ~ 389.1,
+      str_starts(clean_label, "E")  ~ 44.5,
+      str_starts(clean_label, "J")  ~ 173.2,
+      str_starts(clean_label, "K")  ~ 105.5,
+      str_starts(clean_label, "O")  ~ 464.6,
+      str_starts(clean_label, "P")  ~ 275.4,
+      str_starts(clean_label, "R")  ~ 226.7,
+      str_starts(clean_label, "S")  ~ 431.5,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Inspect the lookup table
+dim(geo_categories)
+head(geo_categories, 20)
+
+# Identify integer labels present at sampling locations
+sampled_labels = sort(unique(
+  environmental_values$SA_ID_mapsymbol[
+    !is.na(environmental_values$SA_ID_mapsymbol)
+  ]
+))
+
+# Check which sampled labels exist in the lookup
+unmatched_labels = setdiff(
+  sampled_labels,
+  geo_categories$integer_label
+)
+
+# Inspect the mapping for sampled labels
+sampled_geo_categories = geo_categories %>%
+  filter(integer_label %in% sampled_labels) %>%
+  select(integer_label, mapsymbol, age_Ma) %>%
+  arrange(integer_label)
+
+# Display results
+sampled_labels
+unmatched_labels
+sampled_geo_categories
+
+# Check sampled geological symbols without an assigned age
+unassigned_age_symbols = sampled_geo_categories %>%
+  filter(is.na(age_Ma))
+
+unassigned_age_symbols
+
+# Convert geological-period integer labels to midpoint ages (Ma)
+environmental_values$SA_geoperiod_age_Ma = geo_categories$age_Ma[
+  match(
+    environmental_values$SA_ID_mapsymbol,
+    geo_categories$integer_label
+  )
+]
+
+# Check the recoded values
+summary(environmental_values$SA_geoperiod_age_Ma)
+
+# Confirm missing values are preserved
+sum(is.na(environmental_values$SA_geoperiod_age_Ma))
+
+# Compare original labels and recoded ages
+environmental_values %>%
+  select(
+    sample_number,
+    SA_ID_mapsymbol,
+    SA_geoperiod_age_Ma
+  ) %>%
+  arrange(SA_ID_mapsymbol)
+
+# Check the number of distinct geological ages
+n_distinct(environmental_values$SA_geoperiod_age_Ma, na.rm = TRUE)
+
+# Check for missing values in both columns
+colSums(is.na(environmental_values[
+  c("SA_ID_mapsymbol", "SA_geoperiod_age_Ma")
+]))
+
+# Remove original integer labels
+environmental_values = environmental_values %>%
+  select(-SA_ID_mapsymbol)
+
+# Rename the geological-age predictor
+names(environmental_values)[
+  names(environmental_values) == "SA_geoperiod_age_Ma"
+] = "SA_geoperiod_Ma"
+
+# Confirm updated dimensions and column names
+dim(environmental_values)
+names(environmental_values)
+```
+## 4. Handle missingness and data types
+
+```{r}
+## Missingness audit of all 28 environmental layers
+missingness_audit = environmental_values %>%
+  select(-sample_number) %>%
+  summarise(
+    across(
+      everything(),
+      ~sum(is.na(.))
+    )
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "layer",
+    values_to = "missing"
+  ) %>%
+  mutate(
+    proportion_missing = missing / nrow(environmental_values) * 100
+  ) %>%
+  arrange(desc(proportion_missing))
+
+# Inspect results
+missingness_audit
+```
+
+There's quite a bit of missingness in the IU and veg_mvs31e data. Protected areas make sense since they are probably not mapping a protected area. Let's plot the other layer to see why.
+
+```{r}
+# Plot all 28 selected environmental layers
+for (layer in setdiff(names(environmental_values), "sample_number")) {
+  
+  raster_layer = layer
+  
+  if (layer == "SA_geoperiod_Ma") {
+    raster_layer = "SA_ID_mapsymbol"
+  }
+  
+  terra::plot(
+    complete_cube[[raster_layer]],
+    main = layer
+  )
+}
+```
+Everything looks as expected. NAs in IU layers are meaningful. They represent unprotected areas. TE_Veg_mvs31e_aus1 will be removed because it is actually the MVS labels from an older version of NVIS than we are using now.
+
+```{r}
+# Remove outdated, patchy vegetation predictor
+environmental_values = environmental_values %>%
+  select(-TE_Veg_mvs31e_aus1)
+
+# Label unprotected areas in IU predictors
+IU_layers = c(
+  "IU_ID_TYPE",
+  "IU_ID_NAME",
+  "IU_ID_MGT_PLAN",
+  "IU_ID_ZONE_TYPE"
+)
+
+environmental_values = environmental_values %>%
+  mutate(
+    across(
+      all_of(IU_layers),
+      ~replace_na(as.character(.), "Not protected")
+    )
+  )
+
+# Updated missingness audit
+missingness_audit = environmental_values %>%
+  select(-sample_number) %>%
+  summarise(
+    across(everything(), ~sum(is.na(.)))
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "layer",
+    values_to = "missing"
+  ) %>%
+  mutate(
+    proportion_missing = missing / nrow(environmental_values) * 100
+  ) %>%
+  arrange(desc(proportion_missing))
+
+missingness_audit
+```
+We can handle the small number of missing environmental values during preprocessing. For continuous variables, we can consider median imputation; for categorical variables, we can use an explicit "Unknown" category.
+
+```{r}
+## Audit environmental predictor data types
+predictor_types = data.frame(
+  layer = names(environmental_values),
+  class = sapply(environmental_values, function(x) class(x)[1]),
+  unique_values = sapply(environmental_values, function(x) {
+    dplyr::n_distinct(x, na.rm = TRUE)
+  })
+) %>%
+  filter(layer != "sample_number") %>%
+  arrange(class, layer)
+
+predictor_types
+
+# Define continuous predictors
+continuous_predictors = c(
+  "AA_MAP",
+  "AA_MAT",
+  "AA_avail_P",
+  "AA_elevation",
+  "AA_pH_cacl",
+  "AA_totalP",
+  "AA_total_N",
+  "SA_geoperiod_Ma",
+  "TE_Clim_EAAS",
+  "TE_Clim_rh09ann",
+  "TE_Clim_varan",
+  "TE_Veg_AVHRR_FPAR_Mean",
+  "TE_Veg_Modis_FractCover_Mean_PV",
+  "TE_Veg_NDVI_mean_Q1",
+  "TE_Veg_NDVI_mean_Q2",
+  "TE_Veg_NDVI_mean_Q3",
+  "TE_Veg_NDVI_mean_Q4",
+  "TE_Veg_Persistant_green_Veg"
+)
+
+# Define categorical predictors
+categorical_predictors = c(
+  "IB_IBRA_ID",
+  "TE_Soil_ASC",
+  "TE_Soil_Atlas",
+  "TE_Soil_GenericSoilGroups",
+  "TE_Veg_landuse_18class",
+  "IU_ID_TYPE",
+  "IU_ID_NAME",
+  "IU_ID_MGT_PLAN",
+  "IU_ID_ZONE_TYPE"
+)
+
+# Verify predictor classification
+all_predictors = setdiff(
+  names(environmental_values),
+  "sample_number"
+)
+
+# Check for missing or unclassified predictors
+unclassified_predictors = setdiff(
+  all_predictors,
+  c(continuous_predictors, categorical_predictors)
+)
+
+# Check for duplicated classifications
+duplicated_predictors = intersect(
+  continuous_predictors,
+  categorical_predictors
+)
+
+# Check group sizes
+cat("Total predictors:", length(all_predictors), "\n")
+cat("Continuous:", length(continuous_predictors), "\n")
+cat("Categorical:", length(categorical_predictors), "\n")
+cat("Unclassified:", length(unclassified_predictors), "\n")
+cat("Duplicated:", length(duplicated_predictors), "\n")
+
+unclassified_predictors
+duplicated_predictors
+```
+
+No missing predictors. Data types are correctly identified as continuous or categorical.
+
+## 5. Prepare data for input into neural networks
+
+```{r}
+## Response matrix
+# Verify sample alignment
+stopifnot(
+  identical(
+    modeling_samples$sample_number,
+    environmental_values$sample_number
+  )
+)
+
+# Prepare shared AMF response matrix
+Y = modeling_samples %>%
+  select(-sample_number, -latitude, -longitude)
+
+# Check dimensions and response values
+dim(Y)
+summary(as.vector(as.matrix(Y)))
+```
+
+```{r}
+# Check projected point coordinates
+crs(modeling_points_projected)
+
+# Extract projected coordinates
+projected_coords = terra::crds(modeling_points_projected)
+
+# Create projected sample coordinate table
+sample_coordinates_projected = data.frame(
+  sample_number = modeling_samples$sample_number,
+  x = projected_coords[, 1],
+  y = projected_coords[, 2]
+)
+
+# Check dimensions and missing values
+dim(sample_coordinates_projected)
+colSums(is.na(sample_coordinates_projected))
+head(sample_coordinates_projected)
+```
+```{r}
+## Establish spatial cross-validation set-up to be shared between MLP and CNN
+# Identify unique sampling locations
+unique_locations = sample_coordinates_projected %>%
+  distinct(x, y) %>%
+  mutate(location_id = row_number())
+
+# Assign unique locations to five spatial clusters
+set.seed(123)
+
+spatial_clusters = stats::kmeans(
+  unique_locations %>% select(x, y) %>% as.matrix(),
+  centers = 5,
+  nstart = 50
+)
+
+# Attach cluster assignments to unique locations
+unique_locations$fold = spatial_clusters$cluster
+
+# Map fold assignments back to all samples
+sample_folds = sample_coordinates_projected %>%
+  left_join(
+    unique_locations %>% select(x, y, fold),
+    by = c("x", "y")
+  )
+
+# Check fold sizes
+table(sample_folds$fold)
+
+# Check that every sample received a fold
+sum(is.na(sample_folds$fold))
+
+# Confirm identical coordinates share the same fold
+sample_folds %>%
+  group_by(x, y) %>%
+  summarise(n_folds = n_distinct(fold), .groups = "drop") %>%
+  count(n_folds)
+```
+```{r}
+## Check how well the five folds cover the 147 VTs
+# Prepare response data with spatial fold assignments
+Y_columns = colnames(Y)
+
+folded_Y = sample_folds %>%
+  select(sample_number, fold) %>%
+  inner_join(
+    bind_cols(
+      sample_number = modeling_samples$sample_number,
+      as.data.frame(Y)
+    ),
+    by = "sample_number"
+  )
+
+# Count VT presences within each fold
+fold_Y_counts = folded_Y %>%
+  group_by(fold) %>%
+  summarise(
+    across(all_of(Y_columns), ~sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Summarise response distribution across folds
+fold_summary = fold_Y_counts %>%
+  mutate(
+    total_presences = rowSums(across(all_of(Y_columns))),
+    VTs_without_presences = rowSums(
+      across(all_of(Y_columns), ~.x == 0)
+    ),
+    VTs_with_1_to_4_presences = rowSums(
+      across(all_of(Y_columns), ~.x >= 1 & .x <= 4)
+    )
+  ) %>%
+  left_join(
+    sample_folds %>% count(fold, name = "n_samples"),
+    by = "fold"
+  ) %>%
+  select(
+    fold,
+    n_samples,
+    total_presences,
+    VTs_without_presences,
+    VTs_with_1_to_4_presences
+  ) %>%
+  arrange(fold)
+
+fold_summary
+```
+Five-fold split looks good. Up to a fifth of the rare taxa only have 1-4 presences which might make it hard to evaluate, but I think this is okay for now.
+
+```{r}
+## Save spatial fold assignments
+write.csv(
+  sample_folds,
+  "../processed_data/spatial_folds.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+## Prepare MLP predictor table
+X_MLP_raw = environmental_values %>%
+  select(
+    sample_number,
+    all_of(continuous_predictors),
+    all_of(categorical_predictors)
+  )
+
+# Verify dimensions and sample alignment
+dim(X_MLP_raw)
+
+stopifnot(
+  identical(
+    X_MLP_raw$sample_number,
+    modeling_samples$sample_number
+  )
+)
+
+# Check predictor classes
+sapply(
+  X_MLP_raw %>% select(-sample_number),
+  class
+)
+
+# Count missing values by predictor
+MLP_missingness = X_MLP_raw %>%
+  select(-sample_number) %>%
+  summarise(
+    across(
+      everything(),
+      ~sum(is.na(.))
+    )
+  ) %>%
+  tidyr::pivot_longer(
+    cols = everything(),
+    names_to = "predictor",
+    values_to = "missing"
+  ) %>%
+  mutate(
+    percent_missing = round(missing / nrow(X_MLP_raw) * 100, 2)
+  ) %>%
+  filter(missing > 0) %>%
+  arrange(desc(missing))
+
+MLP_missingness
+
+# Summarise categorical predictor levels to see how many categories there are and if any only occur once
+categorical_summary = data.frame(
+  predictor = categorical_predictors,
+  n_levels = sapply(categorical_predictors, function(v) {
+    x = as.character(X_MLP_raw[[v]])
+    dplyr::n_distinct(x, na.rm = TRUE)
+  }),
+  missing = sapply(categorical_predictors, function(v) {
+    sum(is.na(X_MLP_raw[[v]]))
+  }),
+  singleton_levels = sapply(categorical_predictors, function(v) {
+    x = as.character(X_MLP_raw[[v]])
+    sum(table(x) == 1)
+  })
+)
+
+categorical_summary
+```
+
+For the MLP:
+1. Keep all observed categorical levels, including singletons.
+2. Use one-hot encoding for the categorical predictors.
+3. Fit the category vocabulary using each training fold only.
+4. Map previously unseen validation categories to an "Unknown" representation.
+5. Apply regularisation to the neural network to reduce overfitting.
+
+The reason why I'm suggesting this is because singletons in the AusAMF dataset might still be biologically meaningful (e.g., endemism). Collapsing rare habitats into an other category might get rid of biologically meaningful data.
